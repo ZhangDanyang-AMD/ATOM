@@ -13,6 +13,8 @@ import torch
 import zmq
 from atom.config import Config, ParallelConfig
 from atom.model_engine.async_proc import AsyncIOProcManager
+from atom.model_engine.model_runner import ModelRunner
+from atom.model_engine.engine_utility import EngineUtilityHandler
 from atom.model_engine.scheduler import Scheduler
 from atom.model_engine.sequence import Sequence, SequenceStatus, get_exit_sequence
 from atom.utils import init_exit_handler, make_zmq_socket
@@ -41,6 +43,8 @@ class EngineCoreRequestType(enum.Enum):
     STREAM = b"\x06"
     # Signal that EngineCore is fully initialized and ready
     READY = b"\x07"
+    # Response to a synchronous utility command
+    UTILITY_RESPONSE = b"\x08"
 
 
 class EngineCore:
@@ -51,6 +55,9 @@ class EngineCore:
         self.stream_output_queue = (
             queue.Queue()
         )  # Queue for streaming intermediate outputs
+        # Queue for utility commands (processed in busy_loop to avoid thread contention)
+        self.utility_queue = queue.Queue()
+        self._has_pending_utility = False  # Flag to avoid checking empty queue every loop
         self.input_address = input_address
         self.output_address = output_address
         self.output_thread = threading.Thread(
@@ -76,6 +83,7 @@ class EngineCore:
                 "atom.model_engine.model_runner.ModelRunner",
                 config,
             )
+
             num_blocks = self.runner_mgr.call_func("get_num_blocks", wait_out=True)
             ret = self.runner_mgr.call_func(
                 "allocate_kv_cache", num_blocks, wait_out=True
@@ -118,6 +126,10 @@ class EngineCore:
         # We can not start input thread here since dp need to sync with other ranks,
         # Otherwise, DP will hang always.
         # Thus we add new signal READY to notify CoreManager
+
+        self.utility_handler = EngineUtilityHandler(
+            self.runner_mgr, self.output_queue, label=self.label
+        )
 
         self._send_ready_signal()
         logger.info(f"{self.label}: EngineCore fully initialized and ready")
@@ -171,6 +183,7 @@ class EngineCore:
     def busy_loop(self):
         shutdown = False
         while True:
+            self.utility_handler.process_queue(self.utility_queue, self)
             shutdown = shutdown or self.pull_and_process_input_queue()
             if shutdown:
                 break
@@ -244,7 +257,8 @@ class EngineCore:
                         )
                         self.input_queue.put_nowait(reqs)
                     elif request_type == EngineCoreRequestType.UTILITY:
-                        # Handle utility commands like start_profile/stop_profile
+                        # Put utility commands into queue for processing in busy_loop
+                        # This ensures all runner_mgr.call_func() calls happen in the same thread
                         cmd = reqs.get("cmd") if isinstance(reqs, dict) else None
                         logger.debug(f"{self.label}: input get UTILITY command: {cmd}")
                         if cmd == "start_profile":
@@ -253,6 +267,10 @@ class EngineCore:
                             self.stop_profiler()
                         elif cmd == "get_mtp_stats":
                             self.print_mtp_statistics()
+                        else:
+                            # Queue command for processing in busy_loop (main thread)
+                            self.utility_queue.put_nowait((cmd, reqs))
+                            self._has_pending_utility = True
                     elif request_type == EngineCoreRequestType.SHUTDOWN:
                         logger.debug(f"{self.label}: input get {request_type}")
                         self.input_queue.put_nowait([get_exit_sequence()])
@@ -284,17 +302,31 @@ class EngineCore:
                     logger.debug(f"{self.label}: sent READY signal")
                     continue
 
+                if isinstance(item, tuple) and item[0] == "UTILITY_RESPONSE":
+                    # Send utility command response back to CoreManager
+                    response_data = item[1]
+                    serialized_obj = pickle.dumps(
+                        (EngineCoreRequestType.UTILITY_RESPONSE, response_data)
+                    )
+                    socket.send(serialized_obj)
+                    continue
+
                 # Regular finished sequences
                 seqs = item
                 valid_seqs = [
                     seq for seq in seqs if seq.status != SequenceStatus.EXIT_ENGINE
                 ]
-                num_valid = len(valid_seqs)
-                if num_valid > 0:
-                    obj = pickle.dumps((EngineCoreRequestType.ADD, valid_seqs))
-                    socket.send(obj)
-                    logger.info(f"{self.label}: output send {num_valid} reqs")
-                if len(valid_seqs) != len(seqs):
+                has_exit_seq = len(valid_seqs) != len(seqs)
+                
+                # Only send ADD message if there are valid sequences to report
+                # (Don't send empty ADD when engine is shutting down during init)
+                if valid_seqs:
+                    serialized_obj = pickle.dumps((EngineCoreRequestType.ADD, valid_seqs))
+                    socket.send(serialized_obj)
+                    logger.info(f"{self.label}: output send {len(valid_seqs)} reqs")
+                
+                # Send shutdown if there was an exit sequence
+                if has_exit_seq:
                     socket.send(pickle.dumps((EngineCoreRequestType.SHUTDOWN, None)))
                     logger.debug(
                         f"{self.label}: output send {EngineCoreRequestType.SHUTDOWN}"
@@ -350,6 +382,8 @@ class DPEngineCoreProc(EngineCore):
     def busy_loop(self):
         shutdown = False
         while True:
+            # Process utility commands first (in main thread to avoid race conditions)
+            self.utility_handler.process_queue(self.utility_queue, self)
             shutdown = shutdown or self.pull_and_process_input_queue()
 
             local_is_prefill, local_num_tokens = self.scheduler.get_next_batch_info()
