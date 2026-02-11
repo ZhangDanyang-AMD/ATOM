@@ -42,9 +42,11 @@ class Sequence:
         id=None,
         num_draft_tokens: int = 0,
         mamba_enabled: bool = False,
+        request_id: Optional[str] = None,
     ):
         self.block_size = block_size
         self.id = id or next(Sequence.counter)
+        self.external_request_id = request_id
         self.status = SequenceStatus.WAITING
         self.type = SequenceType.DUMMY
         self.token_ids = copy(token_ids)
@@ -64,6 +66,8 @@ class Sequence:
         self.ignore_eos = sampling_params.ignore_eos
         self.stop_strings = sampling_params.stop_strings
         self.stop_token_sequences = stop_token_sequences or []
+        self.return_logprobs = bool(getattr(sampling_params, "logprobs", False))
+        self.logprobs: list[float] = []
 
         # stream callback
         self.stream_callback = stream_callback
