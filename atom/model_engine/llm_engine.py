@@ -10,7 +10,7 @@ from typing import List, Optional, Union
 from atom.config import Config
 from atom.model_engine.engine_core_mgr import CoreManager
 from atom.model_engine.sequence import Sequence
-from atom.model_engine.weight_sync import load_weights_via_shm
+from atom.rollout.weight_sync import load_weights_via_shm
 from atom.sampling_params import SamplingParams
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
