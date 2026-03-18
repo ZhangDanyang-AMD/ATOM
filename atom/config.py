@@ -770,6 +770,7 @@ class Config:
     enable_dp_attention: bool = False
     torch_dtype: torch.dtype = field(init=False)
     speculative_config: Optional[SpeculativeConfig] = None
+    runner_qualname: str = "atom.model_engine.model_runner.ModelRunner"
 
     # only use for plugin mode
     plugin_config: Optional[PluginConfig] = None

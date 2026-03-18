@@ -35,6 +35,7 @@ class AsyncIOProc:
         # runner class and its args
         runner_qualname: str,  # atom.model_engine.model_runner.ModelRunner
         rank: int,
+        all_ranks_barrier,
         *args,
         **kwargs,
     ):
@@ -59,6 +60,8 @@ class AsyncIOProc:
             t = threading.Thread(target=func, args=(addr, q), daemon=True)
             t.start()
             self.io_threads.append(t)
+
+        self.all_ranks_barrier = all_ranks_barrier
 
         runner_class = resolve_obj_by_qualname(runner_qualname)  # type: ignore
         self.runners = []
@@ -118,14 +121,21 @@ class AsyncIOProc:
                 serialized_obj = pickle.dumps(result)
                 socket.send(serialized_obj)
 
+    # Functions that require all TP ranks to synchronize via barrier before
+    # rank 0 returns, so the caller can safely reuse/overwrite shared buffers.
+    _BARRIER_FUNCS = {"update_weights_from_ipc", "update_weights_from_shm"}
+
     def busy_loop(self):
         while True:
             func_name, args = self.get_func()
+            need_barrier = func_name in self._BARRIER_FUNCS
             for runner in self.runners:
                 func = getattr(runner, func_name, None)
                 if func is None:
                     continue
                 out = func(*args)
+                if need_barrier and self.all_ranks_barrier is not None:
+                    self.all_ranks_barrier.wait()
                 if self.io_addrs[1] is not None and out is not None:
                     self.io_queues[1].put_nowait(out)
             if func_name == "exit":
@@ -157,6 +167,7 @@ class AsyncIOProcManager:
         import atexit
 
         atexit.register(self._cleanup_shared_memory)
+        self.all_ranks_barrier = ctx.Barrier(proc_num)
         init_exit_handler(self)
         for i in range(proc_num):
             label = f"ModelRunner{i}/{proc_num}"
@@ -172,6 +183,7 @@ class AsyncIOProcManager:
                     scheduler_output_handle,
                     runner,
                     i,
+                    self.all_ranks_barrier,
                     *args,
                 ),
             )

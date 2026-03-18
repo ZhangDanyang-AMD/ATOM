@@ -10,7 +10,6 @@ from typing import List, Optional, Union
 from atom.config import Config
 from atom.model_engine.engine_core_mgr import CoreManager
 from atom.model_engine.sequence import Sequence
-from atom.model_engine.weight_sync import load_weights_via_shm
 from atom.sampling_params import SamplingParams
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
@@ -160,35 +159,6 @@ class LLMEngine:
 
     def print_mtp_statistics(self):
         self.core_mgr.send_utility_command("get_mtp_stats")
-
-
-    def wake_up(self, tags: List[str] = None):
-        """
-        Resume resources in GPU memory.
-        """
-        if tags is None:
-            tags = ["weights", "kv_cache"]
-        
-        logger.info(f"LLMEngine wake_up: tags={tags}")
-        self.core_mgr.broadcast_utility_command("resume_memory", tags=tags)
-
-    def sleep(self, level: int = 1):
-        """
-        Release resources to free GPU memory.
-        """
-        logger.info(f"LLMEngine sleep: level={level}")
-        
-        if level >= 1:
-            self.core_mgr.broadcast_utility_command(
-                "release_memory", tags=["kv_cache"]
-            )
-        if level >= 2:
-            self.core_mgr.broadcast_utility_command(
-                "release_memory", tags=["weights"]
-            )
-
-    def load_weights(self, weights, bucket_size_mb: int = 2048):
-        load_weights_via_shm(self.core_mgr, weights, bucket_size_mb)
 
 
 class InputOutputProcessor:

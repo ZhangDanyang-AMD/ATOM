@@ -6,6 +6,7 @@ import logging
 import pickle
 import queue
 import threading
+import time
 from contextlib import ExitStack
 from typing import List
 
@@ -13,8 +14,7 @@ import torch
 import zmq
 from atom.config import Config, ParallelConfig
 from atom.model_engine.async_proc import AsyncIOProcManager
-from atom.model_engine.model_runner import ModelRunner
-from atom.model_engine.engine_utility import EngineUtilityHandler
+from atom.rollout.engine_utility import EngineUtilityHandler
 from atom.model_engine.scheduler import Scheduler
 from atom.model_engine.sequence import Sequence, SequenceStatus, get_exit_sequence
 from atom.utils import init_exit_handler, make_zmq_socket
@@ -58,6 +58,7 @@ class EngineCore:
         # Queue for utility commands (processed in busy_loop to avoid thread contention)
         self.utility_queue = queue.Queue()
         self._has_pending_utility = False  # Flag to avoid checking empty queue every loop
+        self._is_sleeping = False  # True when weights are offloaded (sleep mode)
         self.input_address = input_address
         self.output_address = output_address
         self.output_thread = threading.Thread(
@@ -80,7 +81,7 @@ class EngineCore:
             self.runner_mgr = AsyncIOProcManager(
                 self._finalizer,
                 config.tensor_parallel_size,
-                "atom.model_engine.model_runner.ModelRunner",
+                config.runner_qualname,
                 config,
             )
 
@@ -187,6 +188,9 @@ class EngineCore:
             shutdown = shutdown or self.pull_and_process_input_queue()
             if shutdown:
                 break
+            if self._is_sleeping:
+                time.sleep(0.01)
+                continue
             if not self.scheduler.is_finished():
                 self._process_engine_step()
 
@@ -386,16 +390,28 @@ class DPEngineCoreProc(EngineCore):
             self.utility_handler.process_queue(self.utility_queue, self)
             shutdown = shutdown or self.pull_and_process_input_queue()
 
-            local_is_prefill, local_num_tokens = self.scheduler.get_next_batch_info()
-            local_unfinished = not self.scheduler.is_finished()
+            # Sleeping cores must still participate in _sync_dp_state (NCCL
+            # all_reduce) to prevent other DP ranks from blocking forever.
+            # The sleep flag is included in the sync tensor so that ALL cores
+            # agree to skip model execution together — MoE expert routing and
+            # dummy_execution also contain DP-wide collectives that would hang
+            # if only some cores participated.
+            local_sleeping = self._is_sleeping
+            if not local_sleeping:
+                local_is_prefill, local_num_tokens = self.scheduler.get_next_batch_info()
+                local_unfinished = not self.scheduler.is_finished()
+            else:
+                local_is_prefill, local_num_tokens, local_unfinished = False, 0, False
 
             (
                 global_has_prefill,
                 global_max_tokens,
                 global_has_unfinished,
                 global_shutdown,
+                global_sleeping,
             ) = self._sync_dp_state(
-                local_is_prefill, local_num_tokens, local_unfinished, shutdown
+                local_is_prefill, local_num_tokens, local_unfinished, shutdown,
+                local_sleeping,
             )
 
             if global_shutdown and not global_has_unfinished:
@@ -403,6 +419,11 @@ class DPEngineCoreProc(EngineCore):
                     f"{self.label}: All DP ranks agreed to shutdown, exiting busy_loop"
                 )
                 break
+
+            # If any DP rank is sleeping, all must skip model execution.
+            if global_sleeping:
+                time.sleep(0.01)
+                continue
 
             if not global_has_unfinished and not self.engines_running:
                 self.engines_running = False
@@ -438,18 +459,20 @@ class DPEngineCoreProc(EngineCore):
         local_num_tokens: int,
         local_has_unfinished: bool,
         local_shutdown: bool = False,
-    ) -> tuple[bool, int, bool, bool]:
+        local_sleeping: bool = False,
+    ) -> tuple[bool, int, bool, bool, bool]:
         if self._shutting_down:
-            return (local_is_prefill, local_num_tokens, local_has_unfinished, True)
+            return (local_is_prefill, local_num_tokens, local_has_unfinished, True, local_sleeping)
 
         try:
-            # Pack all state: [is_prefill, num_tokens, has_unfinished, shutdown]
+            # Pack all state: [is_prefill, num_tokens, has_unfinished, shutdown, sleeping]
             state_tensor = torch.tensor(
                 [
                     1 if local_is_prefill else 0,
                     local_num_tokens,
                     1 if local_has_unfinished else 0,
                     1 if local_shutdown else 0,
+                    1 if local_sleeping else 0,
                 ],
                 dtype=torch.int64,
                 device="cpu",
@@ -461,17 +484,19 @@ class DPEngineCoreProc(EngineCore):
             global_max_tokens = state_tensor[1].item()
             global_has_unfinished = state_tensor[2].item() == 1
             global_shutdown = state_tensor[3].item() == 1
+            global_sleeping = state_tensor[4].item() == 1
             return (
                 global_has_prefill,
                 global_max_tokens,
                 global_has_unfinished,
                 global_shutdown,
+                global_sleeping,
             )
         except RuntimeError as e:
             logger.warning(f"{self.label}: _sync_dp_state failed: {e}")
             # If sync fails, assume shutdown to prevent hang
             self._shutting_down = True
-            return (local_is_prefill, local_num_tokens, local_has_unfinished, True)
+            return (local_is_prefill, local_num_tokens, local_has_unfinished, True, local_sleeping)
 
     def _sync_shutdown_state(self, local_should_shutdown: bool) -> bool:
         try:
