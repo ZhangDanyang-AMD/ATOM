@@ -90,12 +90,15 @@ class FusedMoEParallelConfig:
     def make(
         tp_size_: int, dp_size_: int, parallel_config: Config
     ) -> "FusedMoEParallelConfig":
+        tp_rank_local = 0 if tp_size_ == 1 else get_tp_group().rank_in_group
+
         def flatten_tp_across_dp(dp_rank: int):
-            tp_rank = 0 if tp_size_ == 1 else get_tp_group().rank_in_group
-            # There are actually dp_size_ * tp_size_ devices. Update tp_size
-            # and tp_rank so we shard across all devices.
+            # The MoE EP dimension spans every device participating in the
+            # current DP x TP layout. Collapse the local TP rank into a single
+            # global expert rank space so pure DP+EP (tp_size_=1, dp_size_>1)
+            # and mixed DP+TP+EP both assign experts across all devices.
             tp_size = dp_size_ * tp_size_
-            tp_rank = dp_rank * tp_size_ + tp_rank
+            tp_rank = dp_rank * tp_size_ + tp_rank_local
             return tp_size, tp_rank
 
         # Only flatten DP into TP/EP when enable_dp_attention is True.
@@ -111,7 +114,7 @@ class FusedMoEParallelConfig:
             tp_size, tp_rank = flatten_tp_across_dp(dp_rank)
         else:
             tp_size = tp_size_
-            tp_rank = 0 if tp_size_ == 1 else get_tp_group().rank_in_group
+            tp_rank = tp_rank_local
 
         atom_config = get_current_atom_config()
 
@@ -128,10 +131,10 @@ class FusedMoEParallelConfig:
             )
         # DP + EP / TP + EP / DP + TP + EP
         assert use_ep
-        # In EP, each device owns a set of experts fully. There is no tensor
-        # parallel update tp_size, tp_rank, ep_size and ep_rank to reflect that.
-        ep_size = tp_size
-        ep_rank = tp_rank
+        # In EP, each device owns a disjoint expert shard. The expert-parallel
+        # group must therefore span the full DP x TP layout, even when dense
+        # layers keep TP local (i.e. enable_dp_attention is False).
+        ep_size, ep_rank = flatten_tp_across_dp(dp_rank)
         return FusedMoEParallelConfig(
             tp_size=1,
             tp_rank=0,
@@ -282,23 +285,17 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         # assert not moe.use_flashinfer_cutlass_kernels, "Must be created in modelopt.py"
         if moe.use_mori_kernels:
             assert quant_config is not None
+            # Note: We may want to use FP8 dispatch just to reduce
+            # data movement and symmetric heap pressure.
+            use_fp8_dispatch = (
+                quant_config.is_per_act_token or quant_config.is_block_quantized
+            )
             # For PTPC (per token per channel) quant, the scale dim for each token is 1
             # For 1x128 quant, the scale dim for each token is hidden_dim // 128
             scale_dim = 1 if quant_config.is_per_act_token else moe.hidden_dim // 128
 
-            # Check if quant_dtype is an FP8 type
             from aiter import QuantType
 
-            fp8_dtypes = (
-                torch.float8_e4m3fn,
-                torch.float8_e4m3fnuz,
-                torch.float8_e5m2,
-                torch.float8_e5m2fnuz,
-            )
-            is_fp8 = quant_config.quant_dtype in fp8_dtypes
-            # For FP8: enable FP8 dispatch in Mori (quantize before communication)
-            # Note: per_Tensor quant doesn't support num_local_tokens, so we use per_Token
-            use_fp8_dispatch = is_fp8
             quant_type = None
             if use_fp8_dispatch:
                 if quant_config.is_block_quantized:
@@ -306,37 +303,24 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 elif quant_config.is_per_act_token:
                     quant_type = QuantType.per_Token
 
-            # For FP8: use FP8 dtype for communication
-            # For FP4/no quant: use bfloat16
-            # mori_dtype = (
-            #     quant_config.quant_dtype
-            #     if is_fp8 and quant_type is not None
-            #     else torch.bfloat16
-            # )
-            # mori_dtype = torch.bfloat16
+            max_tokens_per_dp_rank = envs.ATOM_MORI_MAX_NUM_TOKENS_PER_DP_RANK
+            if max_tokens_per_dp_rank <= 0:
+                max_tokens_per_dp_rank = moe.max_num_tokens
 
             all_to_all_args = dict(
                 rank=all2all_manager.rank,
                 num_ep_ranks=all2all_manager.world_size,
-                # quant_dtype=mori_dtype,
-                # We now use bfloat16 for mori
-                # TODO: To support quant
-                quant_dtype=moe.in_dtype,
+                quant_dtype=quant_config.quant_dtype,
                 token_hidden_size=moe.hidden_dim,
                 scale_dim=scale_dim,
                 scale_type_size=torch.float32.itemsize,
-                max_num_tokens_per_dp_rank=16384,
-                # input_dtype=moe.in_dtype,
+                max_num_tokens_per_dp_rank=max_tokens_per_dp_rank,
                 input_dtype=moe.in_dtype,
                 num_local_experts=moe.num_experts // all2all_manager.world_size,
                 num_experts_per_token=moe.experts_per_token,
-                gpu_per_node=moe.moe_parallel_config.local_ep_size,
+                gpu_per_node=min(8, all2all_manager.world_size),
             )
             handle = all2all_manager.get_handle(all_to_all_args)
-
-            # We not use quant for mori now
-            use_fp8_dispatch = False
-            quant_type = None
 
             prepare_finalize = MoriPrepareAndFinalize(
                 handle,
@@ -1750,6 +1734,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         fused_shared_experts_scoring_func: Optional[str] = None,
         activation: ActivationType = ActivationType.Silu,
     ) -> torch.Tensor:
+        dummy_token_cap = envs.ATOM_MORI_MAX_NUM_TOKENS_PER_DP_RANK
+        restore_dummy_shape = False
+        original_x = x
+        if dummy_token_cap > 0 and x.shape[0] > dummy_token_cap:
+            x = x[:dummy_token_cap]
+            router_logits = router_logits[:dummy_token_cap]
+            restore_dummy_shape = True
+
         topk_weights, topk_ids = FusedMoE.select_experts(
             hidden_states=x,
             router_logits=router_logits,
@@ -1766,10 +1758,19 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             num_fused_shared_experts=layer.num_fused_shared_experts,
             routed_scaling_factor=layer.routed_scaling_factor,
         )
+        effective_tokens = min(x.shape[0], topk_weights.shape[0], topk_ids.shape[0])
+        if dummy_token_cap > 0:
+            effective_tokens = min(effective_tokens, dummy_token_cap)
+        if effective_tokens != x.shape[0] or effective_tokens != topk_weights.shape[0]:
+            x = x[:effective_tokens]
+            router_logits = router_logits[:effective_tokens]
+            topk_weights = topk_weights[:effective_tokens]
+            topk_ids = topk_ids[:effective_tokens]
+            restore_dummy_shape = True
         # per_Tensor doesn't support num_local_tokens, so fallback to
         # rocm_aiter_fused_moe when using per-tensor or no modular kernel.
         if self.quant_type == QuantType.per_Tensor or self.fused_experts is None:
-            return torch.ops.aiter.rocm_aiter_fused_moe(
+            output = torch.ops.aiter.rocm_aiter_fused_moe(
                 x,
                 layer.w13_weight,
                 layer.w2_weight,
@@ -1784,23 +1785,29 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 a2_scale=layer.w2_input_scale,
                 doweight_stage1=apply_router_weight_on_input,
             )
-        return self.fused_experts(
-            hidden_states=x,
-            w1=layer.w13_weight,
-            w2=layer.w2_weight,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            inplace=False,
-            activation=activation,
-            quant_type=self.quant_type,
-            global_num_experts=global_num_experts,
-            expert_map=expert_map,
-            w1_scale=layer.w13_weight_scale,
-            w2_scale=layer.w2_weight_scale,
-            a1_scale=layer.w13_input_scale,
-            a2_scale=layer.w2_input_scale,
-            apply_router_weight_on_input=apply_router_weight_on_input,
-        )
+        else:
+            output = self.fused_experts(
+                hidden_states=x,
+                w1=layer.w13_weight,
+                w2=layer.w2_weight,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                inplace=False,
+                activation=activation,
+                quant_type=self.quant_type,
+                global_num_experts=global_num_experts,
+                expert_map=expert_map,
+                w1_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                a1_scale=layer.w13_input_scale,
+                a2_scale=layer.w2_input_scale,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+            )
+        if restore_dummy_shape:
+            padded_output = torch.zeros_like(original_x)
+            padded_output[: output.shape[0]] = output
+            output = padded_output
+        return output
 
 
 def determine_expert_map(
@@ -2614,6 +2621,14 @@ class FusedMoE(torch.nn.Module):
         # 1. Pure DP mode: only DP is used
         # 2. DP attention + EP mori Moe
         # 3. DP attention + TP All_gahter/reduce Moe
+        dummy_token_cap = envs.ATOM_MORI_MAX_NUM_TOKENS_PER_DP_RANK
+        restore_dummy_shape = False
+        original_hidden_states = hidden_states
+        if dummy_token_cap > 0 and hidden_states.shape[0] > dummy_token_cap:
+            hidden_states = hidden_states[:dummy_token_cap]
+            router_logits = router_logits[:dummy_token_cap]
+            restore_dummy_shape = True
+
         original_hidden_size = None
         # Use all_gather/reduce_scatter when DP > 1 but not using mori all2all kernels
         if (
@@ -2659,6 +2674,11 @@ class FusedMoE(torch.nn.Module):
             final_hidden_states = get_tp_group().all_reduce(
                 final_hidden_states, ca_fp8_quant=False
             )
+
+        if restore_dummy_shape:
+            padded_hidden_states = torch.zeros_like(original_hidden_states)
+            padded_hidden_states[: final_hidden_states.shape[0]] = final_hidden_states
+            final_hidden_states = padded_hidden_states
 
         return final_hidden_states
 

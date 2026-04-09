@@ -299,8 +299,13 @@ class FusedMoEModularKernel(torch.nn.Module):
         dp_size = get_dp_group().world_size
         topk = topk_ids.shape[1]
         # Use graph_bs for cudagraph compatibility (consistent shape during capture/replay)
-        total_valid_tokens = context.graph_bs * topk * dp_size
-        if total_valid_tokens < dispatch_a1.shape[0] and not context.is_prefill:
+        if context is None:
+            total_valid_tokens = dispatch_a1.shape[0]
+            is_prefill = False
+        else:
+            total_valid_tokens = context.graph_bs * topk * dp_size
+            is_prefill = context.is_prefill
+        if total_valid_tokens < dispatch_a1.shape[0] and not is_prefill:
             dispatch_a1 = dispatch_a1[:total_valid_tokens]
             dispatch_ids = dispatch_ids[:total_valid_tokens]
             dispatch_weights = dispatch_weights[:total_valid_tokens]

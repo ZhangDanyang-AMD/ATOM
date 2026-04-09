@@ -67,6 +67,19 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
     def supports_async(self) -> bool:
         return False
 
+    @staticmethod
+    def _resolve_launch_config(token_count_hint: int) -> tuple[int, int]:
+        context = get_forward_context().context
+        # vLLM's profile/dummy run can invoke the MoE path before ATOM's
+        # forward context is populated. Fall back to a simple token-count
+        # heuristic so MORI warmup still uses a stable launch config.
+        is_prefill = (
+            context.is_prefill if context is not None else token_count_hint > 1
+        )
+        if is_prefill:
+            return 128, 16
+        return 64, 4
+
     def prepare(
         self,
         a1: torch.Tensor,
@@ -97,13 +110,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
 
             quant_func = get_hip_quant(quant_type)
             a1, scale = quant_func(a1, quant_dtype=dtypes.fp8)
-        context = get_forward_context().context
-        if context.is_prefill:
-            block_num = 128
-            warp_per_block = 16
-        else:
-            block_num = 64
-            warp_per_block = 4
+        block_num, warp_per_block = self._resolve_launch_config(a1.shape[0])
 
         (
             dispatch_a1,
@@ -136,13 +143,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         apply_router_weight_on_input: bool,
         # weight_and_reduce_impl: mk.TopKWeightAndReduce,
     ) -> None:
-        context = get_forward_context().context
-        if context.is_prefill:
-            block_num = 128
-            warp_per_block = 16
-        else:
-            block_num = 64
-            warp_per_block = 4
+        block_num, warp_per_block = self._resolve_launch_config(output.shape[0])
 
         num_token = output.shape[0]
         result = self.mori_op.combine(

@@ -45,6 +45,7 @@ def register_platform() -> Optional[str]:
         return None
 
     _set_plugin_mode()
+    _patch_vllm_gpu_model_runner_max_tokens()
 
     # return the ATOM platform to vllm
     return "atom.plugin.vllm.platform.ATOMPlatform"
@@ -77,6 +78,82 @@ def _patch_vllm_attention_process_weights_after_loading(attention) -> None:
 
     setattr(wrapped, "_atom_default_act_dtype_patched", True)
     attention.process_weights_after_loading = wrapped
+
+
+def _patch_vllm_gpu_model_runner_max_tokens() -> None:
+    try:
+        from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+    except Exception:
+        return
+
+    orig_init = GPUModelRunner.__init__
+    if getattr(orig_init, "_atom_dp_ep_token_cap_patched", False):
+        return
+
+    import functools
+
+    @functools.wraps(orig_init)
+    def wrapped(self, *args, **kwargs):
+        orig_init(self, *args, **kwargs)
+
+        token_cap = envs.ATOM_MORI_MAX_NUM_TOKENS_PER_DP_RANK
+        if token_cap <= 0:
+            return
+
+        parallel_config = getattr(self, "parallel_config", None)
+        if parallel_config is None:
+            return
+
+        use_dp_ep = (
+            getattr(parallel_config, "enable_expert_parallel", False)
+            and getattr(parallel_config, "data_parallel_size", 1) > 1
+        )
+        if not use_dp_ep:
+            return
+
+        if getattr(self, "max_num_tokens", 0) > token_cap:
+            logger.warning(
+                "Cap vLLM GPUModelRunner.max_num_tokens from %d to %d for OOT "
+                "DP+EP startup warmup.",
+                self.max_num_tokens,
+                token_cap,
+            )
+            self.max_num_tokens = token_cap
+            if getattr(self, "scheduler_config", None) is not None:
+                self.scheduler_config.max_num_batched_tokens = min(
+                    self.scheduler_config.max_num_batched_tokens,
+                    token_cap,
+                )
+
+    setattr(wrapped, "_atom_dp_ep_token_cap_patched", True)
+    GPUModelRunner.__init__ = wrapped
+
+    orig_dummy_run = GPUModelRunner._dummy_run
+    if not getattr(orig_dummy_run, "_atom_dp_ep_token_cap_patched", False):
+
+        @functools.wraps(orig_dummy_run)
+        def wrapped_dummy_run(self, num_tokens, *args, **kwargs):
+            token_cap = envs.ATOM_MORI_MAX_NUM_TOKENS_PER_DP_RANK
+            parallel_config = getattr(self, "parallel_config", None)
+            use_dp_ep = (
+                token_cap > 0
+                and parallel_config is not None
+                and getattr(parallel_config, "enable_expert_parallel", False)
+                and getattr(parallel_config, "data_parallel_size", 1) > 1
+                and num_tokens > token_cap
+            )
+            if use_dp_ep:
+                logger.warning(
+                    "Cap vLLM GPUModelRunner._dummy_run num_tokens from %d to %d "
+                    "for OOT DP+EP startup warmup.",
+                    num_tokens,
+                    token_cap,
+                )
+                num_tokens = token_cap
+            return orig_dummy_run(self, num_tokens, *args, **kwargs)
+
+        setattr(wrapped_dummy_run, "_atom_dp_ep_token_cap_patched", True)
+        GPUModelRunner._dummy_run = wrapped_dummy_run
 
 
 def register_model() -> None:
@@ -117,6 +194,7 @@ def register_model() -> None:
 
     _patch_vllm_attention_process_weights_after_loading(Attention)
     _patch_vllm_attention_process_weights_after_loading(MLAAttention)
+    _patch_vllm_gpu_model_runner_max_tokens()
 
     # Patch vLLM graph_capture to also enter aiter's ca_comm.capture(),
     # avoiding hipMemcpyAsync in fused_allreduce_rmsnorm when model uses aiter collectives

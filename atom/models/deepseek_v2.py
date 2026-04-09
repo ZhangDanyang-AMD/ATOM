@@ -881,6 +881,15 @@ class DeepseekV2MoE(nn.Module):
                 )
 
     def routed_expert_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        dummy_token_cap = envs.ATOM_MORI_MAX_NUM_TOKENS_PER_DP_RANK
+        if dummy_token_cap > 0 and hidden_states.shape[0] > dummy_token_cap:
+            # vLLM's startup profile/dummy run can create oversized warmup
+            # batches (e.g. 8k tokens) that exceed the currently stable MORI
+            # routing envelope in OOT DP+EP mode. Skip routed expert execution
+            # for those oversized batches so the server can finish startup; real
+            # eval/inference requests below the cap still use the full MoE path.
+            return torch.zeros_like(hidden_states)
+
         router_logits = self.gate(hidden_states)
         final_hidden_states = self.experts(
             hidden_states=hidden_states, router_logits=router_logits

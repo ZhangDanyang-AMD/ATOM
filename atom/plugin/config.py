@@ -36,7 +36,7 @@ class PluginConfig:
 
 
 def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
-    from atom.config import Config, CompilationConfig
+    from atom.config import Config, CompilationConfig, CompilationLevel
 
     vllm_model_config = config.model_config
     vllm_scheduler_config = config.scheduler_config
@@ -50,9 +50,19 @@ def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
     # when you don't want to use atom torch compile, you can also use
     # --enforce-eager to disable the atom torch compile when launch vllm server
     compilation_config = config.compilation_config
+    use_dp_ep = (
+        vllm_parallel_config.enable_expert_parallel
+        and vllm_parallel_config.data_parallel_size > 1
+    )
+    mori_token_cap = envs.ATOM_MORI_MAX_NUM_TOKENS_PER_DP_RANK
+    compilation_level = compilation_config.mode
+    if use_dp_ep:
+        # DP+EP OOT currently relies on MORI/aiter kernels that are more
+        # stable in eager mode than under atom's torch.compile wrapper.
+        compilation_level = CompilationLevel.NO_COMPILATION
     vllm_compilation_config = CompilationConfig(
         # use mode because vllm level argument is deprecated
-        level=compilation_config.mode,
+        level=compilation_level,
         use_cudagraph=False,
         cudagraph_mode=None,
     )
@@ -80,6 +90,15 @@ def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
         max_model_len = vllm_scheduler_config.max_model_len
 
     max_num_batched_tokens = vllm_scheduler_config.max_num_batched_tokens
+    if use_dp_ep and mori_token_cap > 0 and max_num_batched_tokens > mori_token_cap:
+        logger.warning(
+            "Clamping max_num_batched_tokens from %d to %d for vLLM OOT DP+EP "
+            "startup to stay within MORI symmetric heap limits.",
+            max_num_batched_tokens,
+            mori_token_cap,
+        )
+        max_num_batched_tokens = mori_token_cap
+        vllm_scheduler_config.max_num_batched_tokens = mori_token_cap
 
     return Config(
         model=vllm_model_config.model,
