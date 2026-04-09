@@ -92,6 +92,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD": lambda: int(
         os.getenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "1024")
     ),
+    # Deprecated compatibility alias for VLLM_MOE_DP_CHUNK_SIZE in the OOT path.
     "ATOM_MORI_MAX_NUM_TOKENS_PER_DP_RANK": lambda: int(
         os.getenv("ATOM_MORI_MAX_NUM_TOKENS_PER_DP_RANK", "0")
     ),
