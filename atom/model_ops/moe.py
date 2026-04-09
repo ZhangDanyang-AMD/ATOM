@@ -294,6 +294,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             # For 1x128 quant, the scale dim for each token is hidden_dim // 128
             scale_dim = 1 if quant_config.is_per_act_token else moe.hidden_dim // 128
 
+            # Check if quant_dtype is an FP8 type
             from aiter import QuantType
 
             quant_type = None
@@ -303,14 +304,27 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 elif quant_config.is_per_act_token:
                     quant_type = QuantType.per_Token
 
+            # For FP8: use FP8 dtype for communication
+            # For FP4/no quant: use bfloat16
+            # mori_dtype = (
+            #     quant_config.quant_dtype
+            #     if is_fp8 and quant_type is not None
+            #     else torch.bfloat16
+            # )
+            # mori_dtype = torch.bfloat16
+
             all_to_all_args = dict(
                 rank=all2all_manager.rank,
                 num_ep_ranks=all2all_manager.world_size,
+                # quant_dtype=mori_dtype,
+                # We now use bfloat16 for mori
+                # TODO: To support quant
                 quant_dtype=quant_config.quant_dtype,
                 token_hidden_size=moe.hidden_dim,
                 scale_dim=scale_dim,
                 scale_type_size=torch.float32.itemsize,
-                max_num_tokens_per_dp_rank=moe.max_num_tokens,
+                max_num_tokens_per_dp_rank=16384,
+                # input_dtype=moe.in_dtype,
                 input_dtype=moe.in_dtype,
                 num_local_experts=moe.num_experts // all2all_manager.world_size,
                 num_experts_per_token=moe.experts_per_token,
@@ -2006,6 +2020,7 @@ class FusedMoE(torch.nn.Module):
         self.scoring_func = scoring_func
         self.e_score_correction_bias = e_score_correction_bias
         self.activation = activation
+
         self.use_chunked = get_dp_group().world_size > 1
 
         moe = FusedMoEConfig(
@@ -2588,7 +2603,7 @@ class FusedMoE(torch.nn.Module):
 
     def forward_impl_graph(
         self, hidden_states: torch.Tensor, router_logits: torch.Tensor
-    ) -> torch.Tensor:
+    ):
         # There are three mode
         # 1. Pure DP mode: only DP is used
         # 2. DP attention + EP mori Moe
@@ -2643,8 +2658,10 @@ class FusedMoE(torch.nn.Module):
 
     def forward_impl(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
         assert self.quant_method is not None
+        # cuda graph not supported forward with combine and dispatch
         if self.use_chunked:
             return self.forward_impl_graph(hidden_states, router_logits)
+            # return self.forward_impl_chunked(hidden_states, router_logits)
 
         dp_group = get_dp_group()
         if dp_group.world_size > 1:
