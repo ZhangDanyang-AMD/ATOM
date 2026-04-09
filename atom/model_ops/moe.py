@@ -4,7 +4,6 @@
 from abc import abstractmethod
 from dataclasses import dataclass
 from enum import Enum
-import os
 from typing import Callable, List, Optional, Tuple
 
 import torch
@@ -64,22 +63,6 @@ class FusedMoeWeightScaleSupported(Enum):
     CHANNEL = "channel"
     GROUP = "group"
     BLOCK = "block"
-
-
-def _is_moe_dp_chunking_enabled() -> bool:
-    return os.getenv("VLLM_ENABLE_MOE_DP_CHUNK", "1") == "1"
-
-
-def _get_moe_dp_chunk_size() -> int:
-    if envs.is_set("VLLM_MOE_DP_CHUNK_SIZE"):
-        chunk_size = int(os.getenv("VLLM_MOE_DP_CHUNK_SIZE", "256"))
-    elif envs.ATOM_MORI_MAX_NUM_TOKENS_PER_DP_RANK > 0:
-        # Keep the legacy ATOM env as a compatibility alias, but route it
-        # through the same per-rank chunk-size semantics as upstream vLLM.
-        chunk_size = envs.ATOM_MORI_MAX_NUM_TOKENS_PER_DP_RANK
-    else:
-        chunk_size = 256
-    return max(chunk_size, 1)
 
 
 @dataclass
@@ -1766,7 +1749,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         # per_Tensor doesn't support num_local_tokens, so fallback to
         # rocm_aiter_fused_moe when using per-tensor or no modular kernel.
         if self.quant_type == QuantType.per_Tensor or self.fused_experts is None:
-            output = torch.ops.aiter.rocm_aiter_fused_moe(
+            return torch.ops.aiter.rocm_aiter_fused_moe(
                 x,
                 layer.w13_weight,
                 layer.w2_weight,
@@ -1781,25 +1764,23 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 a2_scale=layer.w2_input_scale,
                 doweight_stage1=apply_router_weight_on_input,
             )
-        else:
-            output = self.fused_experts(
-                hidden_states=x,
-                w1=layer.w13_weight,
-                w2=layer.w2_weight,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                inplace=False,
-                activation=activation,
-                quant_type=self.quant_type,
-                global_num_experts=global_num_experts,
-                expert_map=expert_map,
-                w1_scale=layer.w13_weight_scale,
-                w2_scale=layer.w2_weight_scale,
-                a1_scale=layer.w13_input_scale,
-                a2_scale=layer.w2_input_scale,
-                apply_router_weight_on_input=apply_router_weight_on_input,
-            )
-        return output
+        return self.fused_experts(
+            hidden_states=x,
+            w1=layer.w13_weight,
+            w2=layer.w2_weight,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            inplace=False,
+            activation=activation,
+            quant_type=self.quant_type,
+            global_num_experts=global_num_experts,
+            expert_map=expert_map,
+            w1_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            a1_scale=layer.w13_input_scale,
+            a2_scale=layer.w2_input_scale,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+        )
 
 
 def determine_expert_map(
@@ -1958,11 +1939,6 @@ class FusedMoE(torch.nn.Module):
         self.top_k = top_k
         self.global_num_experts = num_experts
         self.shared_expert_scoring_func = shared_expert_scoring_func
-        self.moe_dp_chunk_size = _get_moe_dp_chunk_size()
-        self.use_chunked = (
-            self.moe_parallel_config.use_all2all_kernels
-            and _is_moe_dp_chunking_enabled()
-        )
 
         fuse_shared_experts = is_rocm_aiter_fusion_shared_expert_enabled()
         self.num_fused_shared_experts = (
@@ -2011,11 +1987,7 @@ class FusedMoE(torch.nn.Module):
                     if is_rocm_aiter_fuse_routed_scaling_factor()
                     else 1 / self.routed_scaling_factor
                 ),
-                max_num_tokens=(
-                    self.moe_dp_chunk_size
-                    if self.use_chunked
-                    else atom_config.max_num_batched_tokens
-                ),
+                max_num_tokens=atom_config.max_num_batched_tokens,
                 is_EP=self.use_ep,
             )
         if fuse_shared_experts:
@@ -2034,6 +2006,7 @@ class FusedMoE(torch.nn.Module):
         self.scoring_func = scoring_func
         self.e_score_correction_bias = e_score_correction_bias
         self.activation = activation
+        self.use_chunked = get_dp_group().world_size > 1
 
         moe = FusedMoEConfig(
             num_experts=self.global_num_experts,
@@ -2042,7 +2015,7 @@ class FusedMoE(torch.nn.Module):
             num_local_experts=self.local_num_experts,
             moe_parallel_config=self.moe_parallel_config,
             in_dtype=atom_config.torch_dtype,
-            max_num_tokens=self.moe_dp_chunk_size,
+            max_num_tokens=atom_config.max_num_batched_tokens,
             has_bias=self.has_bias,
             # is_act_and_mul=True,
             is_lora_enabled=False,
@@ -2613,7 +2586,7 @@ class FusedMoE(torch.nn.Module):
             hidden_states, router_logits, self.layer_name
         )
 
-    def _forward_impl_single_chunk(
+    def forward_impl_graph(
         self, hidden_states: torch.Tensor, router_logits: torch.Tensor
     ) -> torch.Tensor:
         # There are three mode
@@ -2668,58 +2641,10 @@ class FusedMoE(torch.nn.Module):
 
         return final_hidden_states
 
-    def forward_impl_graph(
-        self, hidden_states: torch.Tensor, router_logits: torch.Tensor
-    ):
-        return self._forward_impl_single_chunk(hidden_states, router_logits)
-
-    def forward_impl_chunked(
-        self, hidden_states: torch.Tensor, router_logits: torch.Tensor
-    ) -> torch.Tensor:
-        if hidden_states.shape[0] == 0:
-            return hidden_states
-
-        ctx = get_forward_context()
-        if ctx.dp_metadata is None:
-            return self._forward_impl_single_chunk(hidden_states, router_logits)
-
-        max_tokens_across_dispatchers = ctx.dp_metadata.max_tokens_across_dp
-        if max_tokens_across_dispatchers <= self.moe_dp_chunk_size:
-            return self._forward_impl_single_chunk(hidden_states, router_logits)
-
-        num_tokens = hidden_states.size(0)
-        final_hidden_states = torch.empty_like(hidden_states)
-
-        for chunk_idx, chunk_start_raw in enumerate(
-            range(0, max_tokens_across_dispatchers, self.moe_dp_chunk_size)
-        ):
-            chunk_start = min(chunk_start_raw, num_tokens - 1)
-            chunk_end = min(
-                chunk_start + self.moe_dp_chunk_size,
-                max_tokens_across_dispatchers,
-            )
-            chunk_end = min(chunk_end, num_tokens)
-
-            with ctx.dp_metadata.chunked_sizes(self.moe_dp_chunk_size, chunk_idx):
-                hidden_states_chunk = hidden_states[chunk_start:chunk_end, :].contiguous()
-                router_logits_chunk = router_logits[chunk_start:chunk_end, :].contiguous()
-                chunk_output = self._forward_impl_single_chunk(
-                    hidden_states_chunk, router_logits_chunk
-                )
-
-            if chunk_start_raw < num_tokens:
-                final_hidden_states[chunk_start:chunk_end, :].copy_(
-                    chunk_output, non_blocking=True
-                )
-
-        return final_hidden_states
-
     def forward_impl(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
         assert self.quant_method is not None
         if self.use_chunked:
-            return self.forward_impl_chunked(hidden_states, router_logits)
-        if self.moe_parallel_config.use_all2all_kernels:
-            return self._forward_impl_single_chunk(hidden_states, router_logits)
+            return self.forward_impl_graph(hidden_states, router_logits)
 
         dp_group = get_dp_group()
         if dp_group.world_size > 1:
