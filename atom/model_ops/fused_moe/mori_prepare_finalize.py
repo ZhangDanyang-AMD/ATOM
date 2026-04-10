@@ -7,6 +7,8 @@ import torch
 
 import atom.model_ops.fused_moe.modular_kernel as mk
 from atom.model_ops.fused_moe.config import FusedMoEQuantConfig
+from atom.plugin.config import VLLM_MORI_LAUNCH_CONFIG_TOKEN_THRESHOLD
+from atom.plugin.prepare import is_vllm
 from atom.utils.forward_context import get_forward_context
 from aiter import dtypes
 from aiter import QuantType
@@ -68,17 +70,19 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         return False
 
     @staticmethod
-    def _resolve_launch_config(token_count_hint: int) -> tuple[int, int]:
-        context = get_forward_context().context
-        # vLLM's profile/dummy run can invoke the MoE path before ATOM's
-        # forward context is populated. Fall back to a simple token-count
-        # heuristic so MORI warmup still uses a stable launch config.
-        is_prefill = (
-            context.is_prefill if context is not None else token_count_hint > 1
-        )
-        if is_prefill:
-            return 128, 16
-        return 64, 4
+    def _resolve_launch_config(num_tokens: int) -> tuple[int, int]:
+        if is_vllm():
+            # vLLM does not expose a stable prefill/decode flag here, so use a
+            # token-count threshold to keep MORI warmup and runtime selection
+            # deterministic in OOT mode
+            if num_tokens >= VLLM_MORI_LAUNCH_CONFIG_TOKEN_THRESHOLD:
+                return 128, 16
+            return 64, 4
+        else:
+            context = get_forward_context().context
+            if context.is_prefill:
+                return 128, 16
+            return 64, 4
 
     def prepare(
         self,

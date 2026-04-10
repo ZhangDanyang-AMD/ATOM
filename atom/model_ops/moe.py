@@ -41,6 +41,7 @@ from atom.model_ops.topK import (
 )
 from atom.model_ops.topK import rocm_aiter_grouped_topk as grouped_topk
 from atom.model_ops.topK import rocm_aiter_topk_softmax as fused_topk
+from atom.plugin.prepare import is_vllm
 from atom.model_ops.utils import (
     _has_module,
     normalize_e4m3fn_to_e4m3fnuz,
@@ -101,16 +102,17 @@ class FusedMoEParallelConfig:
             tp_rank = dp_rank * tp_size_ + tp_rank_local
             return tp_size, tp_rank
 
-        # Only flatten DP into TP/EP when enable_dp_attention is True.
-        # Otherwise, use pure DP for MoE.
         enable_dp_attention = parallel_config.enable_dp_attention
+        flatten_tp_across_dp_for_moe = enable_dp_attention or (
+            is_vllm() and parallel_config.enable_expert_parallel
+        )
 
         use_ep = dp_size_ * tp_size_ > 1 and parallel_config.enable_expert_parallel
 
         dp_size = dp_size_
         dp_rank = get_dp_group().rank_in_group if dp_size > 1 else 0
 
-        if enable_dp_attention:
+        if flatten_tp_across_dp_for_moe:
             tp_size, tp_rank = flatten_tp_across_dp(dp_rank)
         else:
             tp_size = tp_size_
@@ -131,10 +133,10 @@ class FusedMoEParallelConfig:
             )
         # DP + EP / TP + EP / DP + TP + EP
         assert use_ep
-        # In EP, each device owns a disjoint expert shard. The expert-parallel
-        # group must therefore span the full DP x TP layout, even when dense
-        # layers keep TP local (i.e. enable_dp_attention is False).
-        ep_size, ep_rank = flatten_tp_across_dp(dp_rank)
+        # In EP, each device owns a set of experts fully. There is no tensor
+        # parallel update tp_size, tp_rank, ep_size and ep_rank to reflect that.
+        ep_size = tp_size
+        ep_rank = tp_rank
         return FusedMoEParallelConfig(
             tp_size=1,
             tp_rank=0,
@@ -314,7 +316,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             # )
             # mori_dtype = torch.bfloat16
 
-            if atom_config.plugin_config is not None and atom_config.plugin_config.is_vllm:
+            if is_vllm():
                 # In OOT vLLM mode, use vLLM's per-worker scheduler cap as the
                 # static per-DP-rank capacity for MORI handle sizing.
                 max_num_tokens_per_dp_rank = atom_config.max_num_batched_tokens
@@ -329,7 +331,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 # quant_dtype=mori_dtype,
                 # We now use bfloat16 for mori
                 # TODO: To support quant
-                quant_dtype=quant_config.quant_dtype,
+                quant_dtype=moe.in_dtype,
                 token_hidden_size=moe.hidden_dim,
                 scale_dim=scale_dim,
                 scale_type_size=torch.float32.itemsize,

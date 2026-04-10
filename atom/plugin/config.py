@@ -8,6 +8,10 @@ from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
+# OOT vLLM does not expose a stable prefill/decode flag for MORI launch-config
+# selection, so use a plugin-scoped token-count threshold instead
+VLLM_MORI_LAUNCH_CONFIG_TOKEN_THRESHOLD = 4096
+
 
 @dataclass
 class PluginConfig:
