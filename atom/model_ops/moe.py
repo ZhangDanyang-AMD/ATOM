@@ -285,6 +285,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         # assert not moe.use_flashinfer_cutlass_kernels, "Must be created in modelopt.py"
         if moe.use_mori_kernels:
             assert quant_config is not None
+            atom_config = get_current_atom_config()
             # Note: We may want to use FP8 dispatch just to reduce
             # data movement and symmetric heap pressure.
             use_fp8_dispatch = (
@@ -313,6 +314,15 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             # )
             # mori_dtype = torch.bfloat16
 
+            if atom_config.plugin_config is not None and atom_config.plugin_config.is_vllm:
+                # In OOT vLLM mode, use vLLM's per-worker scheduler cap as the
+                # static per-DP-rank capacity for MORI handle sizing.
+                max_num_tokens_per_dp_rank = atom_config.max_num_batched_tokens
+            else:
+                # Preserve the native ATOM behavior to avoid changing its MORI
+                # capacity tuning semantics.
+                max_num_tokens_per_dp_rank = 16384
+
             all_to_all_args = dict(
                 rank=all2all_manager.rank,
                 num_ep_ranks=all2all_manager.world_size,
@@ -323,7 +333,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 token_hidden_size=moe.hidden_dim,
                 scale_dim=scale_dim,
                 scale_type_size=torch.float32.itemsize,
-                max_num_tokens_per_dp_rank=16384,
+                max_num_tokens_per_dp_rank=max_num_tokens_per_dp_rank,
                 # input_dtype=moe.in_dtype,
                 input_dtype=moe.in_dtype,
                 num_local_experts=moe.num_experts // all2all_manager.world_size,

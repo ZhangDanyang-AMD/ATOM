@@ -3,6 +3,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from atom.model_ops.fused_moe.config import FusedMoEQuantConfig
 from atom.model_ops.fused_moe.utils import disable_inplace
+from atom.plugin.prepare import is_vllm
 from atom.utils.dbo.ubatching import dbo_enabled
 from atom.utils.forward_context import get_forward_context
 import torch
@@ -296,21 +297,37 @@ class FusedMoEModularKernel(torch.nn.Module):
         # mori dispatch expands buffer to (max_tokens * world_size, hidden_dim)
         # but actual valid tokens = graph_bs * topk * dp_size
         context = get_forward_context().context
-        dp_size = get_dp_group().world_size
-        topk = topk_ids.shape[1]
-        # Use graph_bs for cudagraph compatibility (consistent shape during capture/replay)
         if context is None:
-            total_valid_tokens = dispatch_a1.shape[0]
-            is_prefill = False
+            if is_vllm():
+                from atom.plugin.vllm.mori_dispatch import (
+                    trim_vllm_mori_dispatch_tensors,
+                )
+
+                (
+                    dispatch_a1,
+                    dispatch_scale,
+                    dispatch_ids,
+                    dispatch_weights,
+                ) = trim_vllm_mori_dispatch_tensors(
+                    dispatch_a1,
+                    dispatch_scale,
+                    dispatch_ids,
+                    dispatch_weights,
+                    expert_tokens_meta.expert_num_tokens,
+                )
         else:
+            dp_size = get_dp_group().world_size
+            topk = topk_ids.shape[1]
+            # Use graph_bs for cudagraph compatibility (consistent shape during
+            # capture/replay of native ATOM decode execution.
             total_valid_tokens = context.graph_bs * topk * dp_size
             is_prefill = context.is_prefill
-        if total_valid_tokens < dispatch_a1.shape[0] and not is_prefill:
-            dispatch_a1 = dispatch_a1[:total_valid_tokens]
-            dispatch_ids = dispatch_ids[:total_valid_tokens]
-            dispatch_weights = dispatch_weights[:total_valid_tokens]
-            if dispatch_scale is not None:
-                dispatch_scale = dispatch_scale[:total_valid_tokens]
+            if total_valid_tokens < dispatch_a1.shape[0] and not is_prefill:
+                dispatch_a1 = dispatch_a1[:total_valid_tokens]
+                dispatch_ids = dispatch_ids[:total_valid_tokens]
+                dispatch_weights = dispatch_weights[:total_valid_tokens]
+                if dispatch_scale is not None:
+                    dispatch_scale = dispatch_scale[:total_valid_tokens]
 
         fused_out = fused_moe(
             dispatch_a1,
