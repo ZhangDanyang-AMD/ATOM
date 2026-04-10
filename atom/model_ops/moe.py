@@ -323,9 +323,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             # mori_dtype = torch.bfloat16
 
             if is_vllm():
-                # In OOT vLLM mode, use vLLM's per-worker scheduler cap as the
-                # static per-DP-rank capacity for MORI handle sizing.
-                max_num_tokens_per_dp_rank = atom_config.max_num_batched_tokens
+                max_num_tokens_per_dp_rank = moe.max_num_tokens
             else:
                 # Preserve the native ATOM behavior to avoid changing its MORI
                 # capacity tuning semantics.
