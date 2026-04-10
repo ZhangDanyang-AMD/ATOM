@@ -85,18 +85,18 @@ def init_aiter_dist(config: Config) -> None:
         config.plugin_config.is_plugin_mode
     ), "Make sure ATOM is running in plugin mode"
 
-    use_oot_owned_ep = (
+    use_vllm_atom_owned_ep = (
         config.plugin_config.is_vllm
         and config.enable_expert_parallel
         and config.parallel_config.data_parallel_size > 1
     )
 
-    if use_oot_owned_ep:
+    if use_vllm_atom_owned_ep:
         logger.info(
             "Skip vLLM TP reuse for OOT DP+EP so aiter owns TP/PP/DP/EP groups."
         )
 
-    if config.plugin_config.is_vllm and not use_oot_owned_ep:
+    if config.plugin_config.is_vllm and not use_vllm_atom_owned_ep:
         from atom.plugin.vllm.tp_group_reuse import init_aiter_dist_from_vllm
 
         if init_aiter_dist_from_vllm(tensor_parallel_size):

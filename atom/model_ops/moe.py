@@ -341,6 +341,9 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 gpu_per_node=min(8, all2all_manager.world_size),
             )
             handle = all2all_manager.get_handle(all_to_all_args)
+            print('[zejun] FusedMoEMethodBase all_to_all_args = ', all_to_all_args, flush=True)
+            print('[zejun] FusedMoEMethodBase moe = ', moe, flush=True)
+            print('[zejun] FusedMoEMethodBase handle = ', handle, flush=True)
 
             prepare_finalize = MoriPrepareAndFinalize(
                 handle,
@@ -349,6 +352,8 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 use_fp8_dispatch=use_fp8_dispatch,
                 quant_type=quant_type,
             )
+            print('[zejun] FusedMoEMethodBase prepare_finalize = ', prepare_finalize, flush=True)
+            
 
         return prepare_finalize
 

@@ -30,6 +30,8 @@ def is_rocm_aiter_fusion_shared_expert_enabled() -> bool:
         return False
 
     dp_size = config.parallel_config.data_parallel_size
+    # when vllm-atom, the shared expert fusion will be disabled under
+    # DP+EP mode
     if dp_size > 1 and is_vllm() and config.enable_expert_parallel:
         return False
     if dp_size > 1 and _has_module("mori") and config.enable_dp_attention:
