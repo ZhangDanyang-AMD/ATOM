@@ -91,18 +91,20 @@ class FusedMoEParallelConfig:
     def make(
         tp_size_: int, dp_size_: int, parallel_config: Config
     ) -> "FusedMoEParallelConfig":
-        tp_rank_local = 0 if tp_size_ == 1 else get_tp_group().rank_in_group
-
         def flatten_tp_across_dp(dp_rank: int):
-            # The MoE EP dimension spans every device participating in the
-            # current DP x TP layout. Collapse the local TP rank into a single
-            # global expert rank space so pure DP+EP (tp_size_=1, dp_size_>1)
-            # and mixed DP+TP+EP both assign experts across all devices.
+            tp_rank = 0 if tp_size_ == 1 else get_tp_group().rank_in_group
+            # There are actually dp_size_ * tp_size_ devices. Update tp_size
+            # and tp_rank so we shard across all devices.
             tp_size = dp_size_ * tp_size_
-            tp_rank = dp_rank * tp_size_ + tp_rank_local
+            tp_rank = dp_rank * tp_size_ + tp_rank
             return tp_size, tp_rank
 
+        # Only flatten DP into TP/EP when enable_dp_attention is True.
+        # Otherwise, use pure DP for MoE.
         enable_dp_attention = parallel_config.enable_dp_attention
+
+        # for vLLM-ATOM mode, when ep is enabled, the ep rank needs to
+        # be calculated in DP * TP flatten group space
         flatten_tp_across_dp_for_moe = enable_dp_attention or (
             is_vllm() and parallel_config.enable_expert_parallel
         )
@@ -116,7 +118,7 @@ class FusedMoEParallelConfig:
             tp_size, tp_rank = flatten_tp_across_dp(dp_rank)
         else:
             tp_size = tp_size_
-            tp_rank = tp_rank_local
+            tp_rank = 0 if tp_size_ == 1 else get_tp_group().rank_in_group
 
         atom_config = get_current_atom_config()
 
@@ -1957,6 +1959,7 @@ class FusedMoE(torch.nn.Module):
         self.moe_parallel_config = FusedMoEParallelConfig.make(
             tp_size, dp_size, atom_config
         )
+        print('[zejun] FusedMoE moe_parallel_config = ', self.moe_parallel_config, flush=True)
         self.global_num_experts = num_experts
         if self.use_ep:
             self.local_num_experts, self.expert_map = determine_expert_map(
@@ -2053,6 +2056,7 @@ class FusedMoE(torch.nn.Module):
             is_lora_enabled=False,
         )
         self.moe_config = moe
+        print('[zejun] FusedMoE moe_config = ', self.moe_config, flush=True)
 
         # Note: get_quant_method will look at the layer's local_num_experts
         # for heuristic purposes, so it must be initialized first.
