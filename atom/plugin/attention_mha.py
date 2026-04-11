@@ -540,7 +540,7 @@ class PagedAttentionImplPluginModeMethods:
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_q,
             max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_q,
+            max_seqlen_k=max_seqlen_q,  # need to confirm
             min_seqlen_q=min_seqlen_q,
             softmax_scale=self.scale,
             causal=True,
@@ -697,6 +697,8 @@ class PagedAttentionImplPluginModeMethods:
         # as vLLM cuda graph capture padding mechanism, here split the qkvo with
         # the actual tokens
         query = query[:num_actual_tokens]
+        # vLLM can call plugin attention without fused qkv/position tensors for
+        # some dense-model paths (for example Llama). Slice them only when present.
         if qkv is not None:
             qkv = qkv[:num_actual_tokens]
         if position is not None:
