@@ -158,3 +158,5 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             warp_per_block,
         )[0]
         output.copy_(result[:num_token])
+        print('[zejun] MoriPrepareAndFinalize after finalize, output.shape = ', output.shape, flush=True)
+        print('[zejun] MoriPrepareAndFinalize after finalize, result.shape = ', result.shape, flush=True)

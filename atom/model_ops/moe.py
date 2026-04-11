@@ -323,10 +323,9 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             # mori_dtype = torch.bfloat16
 
             if is_vllm():
+                # for vLLM-ATOM, use max num batched token here
                 max_num_tokens_per_dp_rank = moe.max_num_tokens
             else:
-                # Preserve the native ATOM behavior to avoid changing its MORI
-                # capacity tuning semantics.
                 max_num_tokens_per_dp_rank = 16384
 
             all_to_all_args = dict(
@@ -2063,7 +2062,8 @@ class FusedMoE(torch.nn.Module):
             is_lora_enabled=False,
         )
         self.moe_config = moe
-        print('[zejun] FusedMoE moe_config = ', self.moe_config, flush=True)
+        print('[zejun] FusedMoE self.use_chunked = ', self.use_chunked, flush=True)
+        print('[zejun] FusedMoE self.moe_config = ', self.moe_config, flush=True)
 
         # Note: get_quant_method will look at the layer's local_num_experts
         # for heuristic purposes, so it must be initialized first.
