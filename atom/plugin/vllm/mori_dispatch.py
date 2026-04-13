@@ -38,7 +38,9 @@ def _try_get_padded_global_tokens_from_vllm() -> Optional[int]:
 
     dp_metadata = getattr(ctx, "dp_metadata", None)
     if dp_metadata is not None:
-        num_tokens_across_dp_cpu = getattr(dp_metadata, "num_tokens_across_dp_cpu", None)
+        num_tokens_across_dp_cpu = getattr(
+            dp_metadata, "num_tokens_across_dp_cpu", None
+        )
         if num_tokens_across_dp_cpu is not None:
             try:
                 return int(num_tokens_across_dp_cpu.sum().item())
@@ -75,17 +77,14 @@ def trim_vllm_mori_dispatch_tensors(
     # Prefer vLLM's DP-coordinated padded token count so OOT trimming follows
     # the same stable runtime shape contract in eager and cudagraph paths.
     valid_rows = meta.padded_global_tokens
-    # print('[zejun] trim 1 valid_rows = ', valid_rows, flush=True)
     if valid_rows is None:
         # Fallback to MORI's exact recv count only when vLLM runtime metadata
         # is unavailable.
         valid_rows = meta.exact_valid_rows
-    # print('[zejun] trim 2 valid_rows = ', valid_rows, flush=True)
     if valid_rows is None:
         return dispatch_a1, dispatch_scale, dispatch_ids, dispatch_weights
 
     valid_rows = max(0, min(valid_rows, dispatch_a1.shape[0]))
-    # print('[zejun] trim 3 valid_rows = ', valid_rows, flush=True)
     if valid_rows == 0 or valid_rows >= dispatch_a1.shape[0]:
         return dispatch_a1, dispatch_scale, dispatch_ids, dispatch_weights
 

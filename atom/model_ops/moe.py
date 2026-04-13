@@ -351,10 +351,6 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             use_fp8_dispatch = False
             quant_type = None
 
-            # print('[zejun] FusedMoEMethodBase all_to_all_args = ', all_to_all_args, flush=True)
-            # print('[zejun] FusedMoEMethodBase moe = ', moe, flush=True)
-            # print('[zejun] FusedMoEMethodBase handle = ', handle, flush=True)
-
             prepare_finalize = MoriPrepareAndFinalize(
                 handle,
                 max_tokens_per_rank=moe.max_num_tokens,
@@ -362,8 +358,6 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 use_fp8_dispatch=use_fp8_dispatch,
                 quant_type=quant_type,
             )
-            # print('[zejun] FusedMoEMethodBase prepare_finalize = ', prepare_finalize, flush=True)
-            
 
         return prepare_finalize
 
@@ -1965,7 +1959,6 @@ class FusedMoE(torch.nn.Module):
         self.moe_parallel_config = FusedMoEParallelConfig.make(
             tp_size, dp_size, atom_config
         )
-        # print('[zejun] FusedMoE moe_parallel_config = ', self.moe_parallel_config, flush=True)
         self.global_num_experts = num_experts
         if self.use_ep:
             self.local_num_experts, self.expert_map = determine_expert_map(
@@ -2062,8 +2055,6 @@ class FusedMoE(torch.nn.Module):
             is_lora_enabled=False,
         )
         self.moe_config = moe
-        # print('[zejun] FusedMoE self.use_chunked = ', self.use_chunked, flush=True)
-        # print('[zejun] FusedMoE self.moe_config = ', self.moe_config, flush=True)
 
         # Note: get_quant_method will look at the layer's local_num_experts
         # for heuristic purposes, so it must be initialized first.
