@@ -57,7 +57,9 @@ class EngineCore:
         )  # Queue for streaming intermediate outputs
         # Queue for utility commands (processed in busy_loop to avoid thread contention)
         self.utility_queue = queue.Queue()
-        self._has_pending_utility = False  # Flag to avoid checking empty queue every loop
+        self._has_pending_utility = (
+            False  # Flag to avoid checking empty queue every loop
+        )
         self._is_sleeping = False  # True when weights are offloaded (sleep mode)
         self.input_address = input_address
         self.output_address = output_address
@@ -321,14 +323,16 @@ class EngineCore:
                     seq for seq in seqs if seq.status != SequenceStatus.EXIT_ENGINE
                 ]
                 has_exit_seq = len(valid_seqs) != len(seqs)
-                
+
                 # Only send ADD message if there are valid sequences to report
                 # (Don't send empty ADD when engine is shutting down during init)
                 if valid_seqs:
-                    serialized_obj = pickle.dumps((EngineCoreRequestType.ADD, valid_seqs))
+                    serialized_obj = pickle.dumps(
+                        (EngineCoreRequestType.ADD, valid_seqs)
+                    )
                     socket.send(serialized_obj)
                     logger.info(f"{self.label}: output send {len(valid_seqs)} reqs")
-                
+
                 # Send shutdown if there was an exit sequence
                 if has_exit_seq:
                     socket.send(pickle.dumps((EngineCoreRequestType.SHUTDOWN, None)))
@@ -398,7 +402,9 @@ class DPEngineCoreProc(EngineCore):
             # if only some cores participated.
             local_sleeping = self._is_sleeping
             if not local_sleeping:
-                local_is_prefill, local_num_tokens = self.scheduler.get_next_batch_info()
+                local_is_prefill, local_num_tokens = (
+                    self.scheduler.get_next_batch_info()
+                )
                 local_unfinished = not self.scheduler.is_finished()
             else:
                 local_is_prefill, local_num_tokens, local_unfinished = False, 0, False
@@ -410,7 +416,10 @@ class DPEngineCoreProc(EngineCore):
                 global_shutdown,
                 global_sleeping,
             ) = self._sync_dp_state(
-                local_is_prefill, local_num_tokens, local_unfinished, shutdown,
+                local_is_prefill,
+                local_num_tokens,
+                local_unfinished,
+                shutdown,
                 local_sleeping,
             )
 
@@ -462,7 +471,13 @@ class DPEngineCoreProc(EngineCore):
         local_sleeping: bool = False,
     ) -> tuple[bool, int, bool, bool, bool]:
         if self._shutting_down:
-            return (local_is_prefill, local_num_tokens, local_has_unfinished, True, local_sleeping)
+            return (
+                local_is_prefill,
+                local_num_tokens,
+                local_has_unfinished,
+                True,
+                local_sleeping,
+            )
 
         try:
             # Pack all state: [is_prefill, num_tokens, has_unfinished, shutdown, sleeping]
@@ -496,7 +511,13 @@ class DPEngineCoreProc(EngineCore):
             logger.warning(f"{self.label}: _sync_dp_state failed: {e}")
             # If sync fails, assume shutdown to prevent hang
             self._shutting_down = True
-            return (local_is_prefill, local_num_tokens, local_has_unfinished, True, local_sleeping)
+            return (
+                local_is_prefill,
+                local_num_tokens,
+                local_has_unfinished,
+                True,
+                local_sleeping,
+            )
 
     def _sync_shutdown_state(self, local_should_shutdown: bool) -> bool:
         try:

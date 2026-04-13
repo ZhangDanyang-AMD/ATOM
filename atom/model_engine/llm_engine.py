@@ -34,8 +34,7 @@ class LLMEngine:
     def __init__(self, model, tokenizer=None, **kwargs):
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
-        data_parallel_size = kwargs.get('data_parallel_size', 1)
-        trust_remote_code = kwargs.get('trust_remote_code', False)
+        data_parallel_size = kwargs.get("data_parallel_size", 1)
         config = Config(model, **config_kwargs)
         self.tokenizer = tokenizer or _load_tokenizer(
             config.model, config.trust_remote_code
@@ -107,10 +106,13 @@ class LLMEngine:
             request_id_iter = iter(request_ids)
         else:
             request_id_iter = itertools.repeat(None)
-        
+
         reqs = []
         for prompt, sampling_param, callback, request_id in zip(
-            prompt_or_tokens_list, sampling_params_iter, stream_callback_iter, request_id_iter
+            prompt_or_tokens_list,
+            sampling_params_iter,
+            stream_callback_iter,
+            request_id_iter,
         ):
             req = self.io_processor.preprocess(
                 prompt,
@@ -137,7 +139,7 @@ class LLMEngine:
     ) -> list[str]:
         # Reset round-robin counter to ensure consistent DP not core dump
         self.core_mgr._rr_counter = 0
-        
+
         self.add_request(prompts, sampling_params, request_ids=request_ids)
         outputs = {}
         while not self.is_finished() and (
@@ -211,7 +213,7 @@ class InputOutputProcessor:
                 stop_tokens = self.tokenizer.encode(stop_str, add_special_tokens=False)
                 if stop_tokens:
                     stop_token_sequences.append(stop_tokens)
-        
+
         seq = Sequence(
             tokens,
             self.block_size,
