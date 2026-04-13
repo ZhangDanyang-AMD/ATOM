@@ -105,7 +105,7 @@
     "model_name": "DeepSeek-R1-FP8 DP8+EP8",
     "model_path": "deepseek-ai/DeepSeek-R1-0528",
     "extraArgs": "--data-parallel-size 8 --enable-expert-parallel",
-    "env_vars": "MORI_SHMEM_HEAP_SIZE=8G",
+    "env_vars": "MORI_SHMEM_MODE=ISOLATION",
     "runner": "linux-atom-mi35x-8",
     "test_level": "nightly",
     "accuracy_threshold": 0.93,

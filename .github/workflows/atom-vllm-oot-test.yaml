@@ -919,7 +919,7 @@ jobs:
                   "model_path": "deepseek-ai/DeepSeek-R1-0528",
                   "extra_args": "--data-parallel-size 8 --enable-expert-parallel",
                   "accuracy_test_threshold": 0.93,
-                  "env_vars": "MORI_SHMEM_HEAP_SIZE=8G",
+                  "env_vars": "MORI_SHMEM_MODE=ISOLATION",
                   "runner": "linux-atom-mi35x-8",
               },
               {
