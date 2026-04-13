@@ -278,12 +278,6 @@ class FusedMoEModularKernel(torch.nn.Module):
         if global_num_experts == -1:
             global_num_experts = local_num_experts
 
-        # print('[zejun] FusedMoE before prepare, hidden_states.shape = ', hidden_states.shape, flush=True)
-        # print('[zejun] FusedMoE before prepare, topk_ids.shape = ', topk_ids.shape, flush=True)
-        # print('[zejun] FusedMoE before prepare, global_num_experts = ', global_num_experts, flush=True)
-        # print('[zejun] FusedMoE before prepare, expert_map = ', expert_map, flush=True)
-        # print('[zejun] FusedMoE before prepare, quant_type = ', quant_type, flush=True)
-
         (
             dispatch_a1,
             dispatch_scale,
@@ -310,9 +304,6 @@ class FusedMoEModularKernel(torch.nn.Module):
                     trim_vllm_mori_dispatch_tensors,
                 )
 
-                # print('[zejun] FusedMoE before trim, dispatch_a1.shape = ', dispatch_a1.shape, flush=True)
-                # print('[zejun] FusedMoE before trim, dispatch_ids.shape = ', dispatch_ids.shape, flush=True)
-
                 (
                     dispatch_a1,
                     dispatch_scale,
@@ -325,9 +316,6 @@ class FusedMoEModularKernel(torch.nn.Module):
                     dispatch_weights,
                     expert_tokens_meta.expert_num_tokens,
                 )
-
-                # print('[zejun] FusedMoE after trim, dispatch_a1.shape = ', dispatch_a1.shape, flush=True)
-                # print('[zejun] FusedMoE after trim, dispatch_ids.shape = ', dispatch_ids.shape, flush=True)
 
         else:
             dp_size = get_dp_group().world_size
