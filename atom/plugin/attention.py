@@ -7,6 +7,7 @@ import torch
 
 from aiter import dtypes, get_mla_metadata_info_v1, get_mla_metadata_v1
 from aiter.dist.parallel_state import get_tp_group
+from aiter.jit.utils.chip_info import get_gfx
 from atom.plugin.prepare import is_vllm, is_sglang
 from atom.utils import CpuGpuBuffer, envs
 from atom.utils.block_convert import kv_indices_generate_triton
@@ -723,16 +724,25 @@ class vllmMLAAttentionMetadataBuilderMethods:
             "Its methods are meant to be added to other classes via decorators."
         )
 
+    def _get_max_split_per_batch(self, max_seqlen_k: int) -> int:
+        if get_gfx() != "gfx950":
+            return 16
+        if max_seqlen_k <= 2048:
+            return 16
+        if max_seqlen_k <= 16384:
+            return 32
+        return 64
+
     # TODO: support mtp and sparse
     def _set_mla_persistent_worker_buffers(
-        self, bs: int, cu_seqlens_q: torch.Tensor, max_q_len: int = 1
+        self, bs: int, cu_seqlens_q: torch.Tensor, max_q_len: int = 1, max_seq_len: int = 0
     ):
         split_params = {
             "kv_granularity": max(self.block_size, 16),
             "max_seqlen_qo": max_q_len,
             "uni_seqlen_qo": max_q_len,
             "fast_mode": 1,
-            "max_split_per_batch": 16,
+            "max_split_per_batch": self._get_max_split_per_batch(max_seq_len) if max_seq_len > 0 else 64,
         }
         var = self.mla_persistent_metadata
         work_meta_data = var["work_meta_data"]
@@ -832,7 +842,7 @@ class vllmMLAAttentionMetadataBuilderMethods:
                 self.qo_indptr[1 + num_reqs :] = num_decode_tokens
         qo_indptr = self.qo_indptr[: 1 + num_reqs]
 
-        ctx_mla_ps = self._set_mla_persistent_worker_buffers(num_reqs, qo_indptr, 1)
+        ctx_mla_ps = self._set_mla_persistent_worker_buffers(num_reqs, qo_indptr, 1, max_seq_len)
         self.mla_persistent_metadata.update(ctx_mla_ps)
 
         attn_metadata = AiterMLADecodeMetadataForPluginMode(

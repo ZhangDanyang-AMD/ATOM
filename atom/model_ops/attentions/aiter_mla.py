@@ -12,6 +12,7 @@ from aiter import (
     get_mla_metadata_info_v1,
     get_mla_metadata_v1,
 )
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.dist.parallel_state import get_tp_group
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mla import _MLA_MIN_HEADS, MLAAttention
@@ -150,19 +151,29 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # return self.model_runner.tokenID_processor.async_copy_stream
         return self.model_runner.async_execute_stream
 
+    def _get_max_split_per_batch(self, max_seqlen_k: int) -> int:
+        if get_gfx() != "gfx950":
+            return 16
+        if max_seqlen_k <= 2048:
+            return 16
+        if max_seqlen_k <= 16384:
+            return 32
+        return 64
+
     def set_mla_persistent_worker_buffers(
         self,
         bs: int,
         max_q_len: int,
         only_update: bool = False,
         num_reject_tokens: torch.Tensor = None,
+        max_seqlen_k: int = 0,
     ):
         split_params = {
             "kv_granularity": max(self.block_size, 16),
             "max_seqlen_qo": max_q_len,
             "uni_seqlen_qo": max_q_len,
             "fast_mode": 1,
-            "max_split_per_batch": 16,
+            "max_split_per_batch": self._get_max_split_per_batch(max_seqlen_k) if max_seqlen_k > 0 else 64,
         }
         var = self.model_runner.forward_vars
         work_meta_data = var["work_meta_data"]
@@ -252,7 +263,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             max_seqlen_k,
         )
         return self.set_mla_persistent_worker_buffers(
-            bs, max_seqlen_q, only_update, num_reject_tokens
+            bs, max_seqlen_q, only_update, num_reject_tokens, max_seqlen_k
         )
 
     def prepare_prefill(self, batch: ScheduledBatch):
@@ -458,10 +469,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 max_seqlen_k,
             )
 
-        # metadata copies on main_stream
         positions = var["positions"].copy_to_gpu(sum_scheduled_tokens)
         ctx.update({el: var[el].copy_to_gpu(num) for el, num in vars_for_metadata})
-        ctx_mla_ps = self.set_mla_persistent_worker_buffers(bs, max_seqlen_q)
+        ctx_mla_ps = self.set_mla_persistent_worker_buffers(bs, max_seqlen_q, max_seqlen_k=max_seqlen_k)
         ctx.update(ctx_mla_ps)
         current_stream.wait_stream(prep_stream)
         # if self.block_ratio > 1:
