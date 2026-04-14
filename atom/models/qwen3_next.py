@@ -176,6 +176,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         self.ep_rank = get_ep_group().rank_in_group
         self.ep_size = self.ep_group.size()
         self.n_routed_experts = config.num_experts
+        self.n_shared_experts = config.n_shared_experts
 
         # self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe
 
@@ -208,19 +209,19 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         )
         # print(f"layer {prefix}, gate weight: {self.gate.weight.data}", flush=True)
 
-        # self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
-
         if (
             config.shared_expert_intermediate_size > 0
             and not is_rocm_aiter_fusion_shared_expert_enabled()
         ):
+            # the expert gate is None because the shared expert gate
+            # has been fused into the self.gate
             self.shared_expert = Qwen3NextMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.shared_expert_intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 reduce_results=False,
-                expert_gate=self.shared_expert_gate,
+                expert_gate=None,
                 prefix=f"{prefix}.shared_expert",
             )
         else:
@@ -251,13 +252,28 @@ class Qwen3NextSparseMoeBlock(nn.Module):
 
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
-        routed_output = self.experts(
-            hidden_states=hidden_states, router_logits=router_logits
-        )
         if not is_rocm_aiter_fusion_shared_expert_enabled():
+            # In the non-fusion path the merged gate still carries both routed
+            # and shared-expert scores, so split them before routing.
+            routed_logits, shared_gate_logits = torch.split(
+                router_logits,
+                [self.n_routed_experts, self.n_shared_experts],
+                dim=-1,
+            )
+            assert self.shared_expert is not None, (
+                "Qwen3Next non-fusion shared-expert path requires a standalone "
+                "shared_expert module."
+            )
+            routed_output = self.experts(
+                hidden_states=hidden_states, router_logits=routed_logits
+            )
             shared_output = self.shared_expert(hidden_states)
+            shared_output = torch.sigmoid(shared_gate_logits) * shared_output
             final_hidden_states = shared_output + routed_output
         else:
+            routed_output = self.experts(
+                hidden_states=hidden_states, router_logits=router_logits
+            )
             final_hidden_states = routed_output
 
         if self.tp_size > 1:
