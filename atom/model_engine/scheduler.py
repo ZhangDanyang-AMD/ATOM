@@ -299,6 +299,8 @@ class ScheduledBatch:
         self.is_dummy_run = is_dummy_run
         self.num_spec_step = num_spec_step
 
+        self.external_request_ids = [seq.external_request_id for seq in seqs.values()]
+
         # logger.info(f"{[el for el in scheduled_spec_decode_tokens.keys()]=}")
         # logger.info(f"{self.num_scheduled_tokens=}")
         # logger.info(f"{self.context_lens=}")
