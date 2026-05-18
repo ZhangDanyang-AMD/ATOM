@@ -325,6 +325,9 @@ class EngineCore:
                             self.stop_profiler()
                         elif cmd == "get_mtp_stats":
                             self.print_mtp_statistics()
+                        elif cmd == "get_mtp_statistics":
+                            response = {"cmd": cmd, "result": self.get_mtp_statistics()}
+                            self.output_queue.put_nowait(("UTILITY_RESPONSE", response))
                         else:
                             # Queue command for processing in busy_loop (main thread)
                             self.utility_queue.put_nowait((cmd, reqs))
@@ -404,6 +407,14 @@ class EngineCore:
             logger.info(
                 "\n[MTP Stats] No MTP statistics available (MTP not enabled or no tokens processed)\n"
             )
+
+    def get_mtp_statistics(self):
+        if self.scheduler.spec_stats is None:
+            return {"enabled": False}
+
+        stats = self.scheduler.spec_stats.get_statistics()
+        stats["enabled"] = True
+        return stats
 
 
 class DPEngineCoreProc(EngineCore):
