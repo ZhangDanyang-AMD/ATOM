@@ -4,7 +4,6 @@ import logging
 import torch
 from atom.plugin.prepare import _set_framework_backbone
 from atom.utils import envs
-from atom.plugin.vllm.mla_patch import patch_vllm_mla_attention
 
 logger = logging.getLogger("atom")
 
@@ -116,6 +115,7 @@ def register_model() -> None:
         vllm_model_registry._try_load_model_cls.cache_clear()
         vllm_model_registry._try_inspect_model_cls.cache_clear()
 
+    from atom.plugin.vllm.mla_patch import patch_vllm_mla_attention
     patch_vllm_mla_attention()
     # patch attention process weights after loading
     # to avoid the specific handle in ATOM loader
@@ -132,3 +132,13 @@ def register_model() -> None:
     from atom.plugin.vllm.graph_capture_patch import apply_graph_capture_patch
 
     apply_graph_capture_patch()
+
+    # Eagerly trigger lazy class builds for multimodal ATOM models so that
+    # _processor_factory is set on the wrapper class before vLLM's engine
+    # init checks for it.  In the subprocess (no GPU), the build fails
+    # harmlessly — _processor_factory is only needed in the GPU process.
+    try:
+        from atom.plugin.vllm.models import kimi_k25
+        _ = kimi_k25.KimiK25ForConditionalGeneration_
+    except Exception:
+        pass

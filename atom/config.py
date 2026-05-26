@@ -933,8 +933,8 @@ class Config:
             and len(self.quant_config.exclude_layers) == 0
         ):
             vllm_ignored = getattr(
-                self.plugin_config.vllm_config.quant_config, "ignored_layers", []
-            )
+                self.plugin_config.vllm_config.quant_config, "ignored_layers", None
+            ) or []
             self.quant_config.exclude_layers = list(vllm_ignored)
         hf_config_max_position_embeddings = getattr(
             self.hf_config, "max_position_embeddings", 8192

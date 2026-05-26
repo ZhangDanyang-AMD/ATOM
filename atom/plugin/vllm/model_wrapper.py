@@ -3,10 +3,6 @@ from collections.abc import Iterable
 import importlib
 import torch
 import torch.nn as nn
-from aiter.dist.parallel_state import (
-    get_pp_group,
-    get_tp_group,
-)
 from vllm.config import VllmConfig
 from vllm.model_executor.models.interfaces import (
     SupportsPP,
@@ -25,10 +21,6 @@ from vllm.forward_context import (
     is_forward_context_available,
 )
 
-import atom  # noqa: F401
-from atom.plugin.config import generate_atom_config_for_plugin_mode
-from atom.plugin.prepare import _set_framework_backbone
-
 import logging
 
 logger = logging.getLogger("atom")
@@ -40,14 +32,12 @@ _ATOM_MODEL_CLASSES: dict[str, str] = {
     "Qwen3MoeForCausalLM": "atom.models.qwen3_moe:Qwen3MoeForCausalLM",
     "GptOssForCausalLM": "atom.models.gpt_oss:GptOssForCausalLM",
     "DeepseekV3ForCausalLM": "atom.models.deepseek_v2:DeepseekV3ForCausalLM",
-    "DeepseekV32ForCausalLM": "atom.models.deepseek_v2:DeepseekV3ForCausalLM",
     "Glm4MoeForCausalLM": "atom.models.glm4_moe:Glm4MoeForCausalLM",
     "GlmMoeDsaForCausalLM": "atom.models.deepseek_v2:GlmMoeDsaForCausalLM",
     "Qwen3NextForCausalLM": "atom.models.qwen3_next:Qwen3NextForCausalLM",
     "Qwen3_5MoeForConditionalGeneration": "atom.models.qwen3_5:Qwen3_5MoeForConditionalGeneration_",
     "Qwen3_5ForConditionalGeneration": "atom.models.qwen3_5:Qwen3_5ForConditionalGeneration_",
     "KimiK25ForConditionalGeneration": "atom.plugin.vllm.models.kimi_k25:KimiK25ForConditionalGeneration_",
-    "MiniMaxM2ForCausalLM": "atom.models.minimax_m2:MiniMaxM2ForCausalLM",
 }
 
 
@@ -64,23 +54,37 @@ def _get_atom_model_cls(model_arch: str) -> type:
 def _prepare_env(atom_config) -> None:
     from atom.plugin.register import set_attn_cls, init_aiter_dist
 
-    # set global attention class
     logger.info("Set global attention class")
     set_attn_cls()
 
-    # init aiter dist for using aiter custom collective ops
     logger.info("Init aiter dist for using aiter custom collective ops")
     init_aiter_dist(config=atom_config)
 
 
 class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
+    supports_eagle3: bool = True
+    has_own_embed_tokens: bool = False
+    has_own_lm_head: bool = False
+
     def __init_subclass__(cls, *args, **kwargs):
         super().__init_subclass__(*args, **kwargs)
+
+    # ---- Eagle3 aux hidden state capture (forward hooks) ----
+    _eagle3_aux_layers: tuple[int, ...] = ()
+    _eagle3_captured: dict[int, torch.Tensor]
+    _eagle3_hooks: list[torch.utils.hooks.RemovableHandle]
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
-        _set_framework_backbone("vllm")
+        # Lazy imports: aiter/atom require GPU, must not be imported at module level
+        # (vLLM's registry subprocess inspects the class without GPU access)
+        from aiter.dist.parallel_state import get_pp_group, get_tp_group  # noqa: F811
+        import atom  # noqa: F401,F811
+        from atom.plugin.config import generate_atom_config_for_plugin_mode
+
+        self._get_pp_group = get_pp_group
+        self._get_tp_group = get_tp_group
 
         self.config = vllm_config.model_config.hf_config
         self.text_config = self.config.get_text_config()
@@ -119,10 +123,6 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         if exclude_mapping and self.atom_config.quant_config is not None:
             self.atom_config.quant_config.apply_exclude_name_mapping(exclude_mapping)
 
-        default_excludes = getattr(model_cls, "quant_default_exclude_layers", [])
-        if default_excludes and self.atom_config.quant_config is not None:
-            self.atom_config.quant_config.apply_default_exclude_layers(default_excludes)
-
         logger.info(f"Construct ATOM model {model_arch} for vLLM plugin mode")
         self.model = model_cls(self.atom_config)
 
@@ -138,8 +138,13 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             )
 
         # here init aiter dist for using aiter custom collective ops
-        self.pp_group = get_pp_group()
-        self.tp_group = get_tp_group()
+        self.pp_group = self._get_pp_group()
+        self.tp_group = self._get_tp_group()
+
+        # Eagle3 state
+        self._eagle3_aux_layers = ()
+        self._eagle3_captured = {}
+        self._eagle3_hooks = []
 
     def _register_indexer_caches_with_vllm(self):
         """Register DeepseekV32IndexerCache instances with vLLM so that:
@@ -206,6 +211,79 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
                     f"static_forward_context, skipping"
                 )
 
+    # ---- Eagle3 interface (for extract_hidden_states speculative mode) ----
+
+    def _find_decoder_layers(self) -> nn.ModuleList | None:
+        """Locate the decoder layer ModuleList in the inner ATOM model."""
+        for path in (
+            "model.layers",
+            "layers",
+            "language_model.model.layers",
+        ):
+            obj = self.model
+            for attr in path.split("."):
+                obj = getattr(obj, attr, None)
+                if obj is None:
+                    break
+            if obj is not None and isinstance(obj, nn.ModuleList):
+                return obj
+        return None
+
+    def _eagle3_hook_fn(
+        self, layer_idx: int, _module: nn.Module, _input, output
+    ):
+        """Forward hook: capture hidden_states + residual from decoder layer."""
+        if isinstance(output, tuple) and len(output) >= 2:
+            hidden_states, residual = output[0], output[1]
+            self._eagle3_captured[layer_idx] = (
+                hidden_states + residual
+                if residual is not None
+                else hidden_states
+            )
+        else:
+            self._eagle3_captured[layer_idx] = output
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        # Remove previous hooks
+        for h in self._eagle3_hooks:
+            h.remove()
+        self._eagle3_hooks.clear()
+        self._eagle3_aux_layers = layers
+
+        if not layers:
+            return
+
+        decoder_layers = self._find_decoder_layers()
+        if decoder_layers is None:
+            logger.warning(
+                "Cannot find decoder layers for Eagle3 hooks; "
+                "falling back to inner model if supported"
+            )
+            if hasattr(self.model, "set_aux_hidden_state_layers"):
+                self.model.set_aux_hidden_state_layers(layers)
+            return
+
+        for idx in layers:
+            if idx < len(decoder_layers):
+                hook = decoder_layers[idx].register_forward_hook(
+                    lambda mod, inp, out, i=idx: self._eagle3_hook_fn(
+                        i, mod, inp, out
+                    )
+                )
+                self._eagle3_hooks.append(hook)
+                logger.info("Eagle3 hook registered on decoder layer %d", idx)
+            else:
+                logger.warning(
+                    "Eagle3 layer index %d out of range (%d layers)",
+                    idx, len(decoder_layers),
+                )
+
+    def get_eagle3_default_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        if hasattr(self.model, "get_eagle3_default_aux_hidden_state_layers"):
+            return self.model.get_eagle3_default_aux_hidden_state_layers()
+        num_layers = getattr(self.text_config, "num_hidden_layers", 32)
+        return (2, num_layers // 2, num_layers - 3)
+
     def forward(
         self,
         input_ids: torch.Tensor | None,
@@ -228,6 +306,9 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             ]
             buf[: positions.numel()].copy_(positions)
 
+        # Clear captured aux states before forward
+        self._eagle3_captured = {}
+
         hidden_states = self.model(
             input_ids=input_ids,
             positions=positions,
@@ -238,6 +319,16 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
 
         if not self.pp_group.is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
+
+        # Eagle3: return (hidden_states, aux_hidden_states_list) when active
+        if self._eagle3_aux_layers and self._eagle3_captured:
+            aux_list = [
+                self._eagle3_captured[i]
+                for i in sorted(self._eagle3_aux_layers)
+                if i in self._eagle3_captured
+            ]
+            if aux_list:
+                return hidden_states, aux_list
 
         return hidden_states
 

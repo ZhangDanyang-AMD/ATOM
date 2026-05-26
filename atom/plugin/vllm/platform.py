@@ -3,6 +3,11 @@
 This module contains the vLLM `Platform` subclass used in ATOM's vLLM plugin
 mode. Keep platform behavior here so `register.py` can focus on registration
 and wiring only.
+
+The ATOMPlatform class is created lazily (on first attribute access) because
+vLLM's subprocess model inspection imports this module without GPU access,
+and ``from vllm.platforms.rocm import RocmPlatform`` triggers
+``_get_gcn_arch()`` which requires a GPU.
 """
 
 import logging
@@ -14,12 +19,13 @@ logger = logging.getLogger("atom")
 disable_vllm_plugin = envs.ATOM_DISABLE_VLLM_PLUGIN
 disable_vllm_plugin_attention = envs.ATOM_DISABLE_VLLM_PLUGIN_ATTENTION
 
-if not disable_vllm_plugin:
+_ATOMPlatform = None
+
+
+def _build_atom_platform_cls():
     from vllm.platforms.rocm import RocmPlatform
 
     class ATOMPlatform(RocmPlatform):
-        # For multi-modality models, to make AiterBackend supported by ViT,
-        # get_supported_vit_attn_backends may need to be overridden here
         @classmethod
         def get_attn_backend_cls(
             cls, selected_backend, attn_selector_config, num_heads
@@ -37,5 +43,15 @@ if not disable_vllm_plugin:
                 return "atom.model_ops.attentions.aiter_mla.AiterMLABackend"
             return "atom.model_ops.attentions.aiter_attention.AiterBackend"
 
-else:
-    ATOMPlatform = None
+    return ATOMPlatform
+
+
+def __getattr__(name):
+    global _ATOMPlatform
+    if name == "ATOMPlatform":
+        if disable_vllm_plugin:
+            return None
+        if _ATOMPlatform is None:
+            _ATOMPlatform = _build_atom_platform_cls()
+        return _ATOMPlatform
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
