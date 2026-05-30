@@ -1,0 +1,265 @@
+import logging
+import threading
+from abc import ABC
+from typing import Any, Dict, Optional
+
+import torch
+from mooncake.store import MooncakeDistributedStore
+
+from atom.transfer.mooncake_config import MooncakeConfig
+from atom.transfer.buffers import (
+    AsyncPutManager,
+    GPUReceiveBuffer,
+    GPUSendBuffer,
+    HostBufferPool,
+)
+
+logger = logging.getLogger("atom")
+
+
+class MooncakeHiddenStateStore(ABC):
+    def __init__(self, config: MooncakeConfig):
+        self.config = config
+        self._store: Optional[MooncakeDistributedStore] = None
+        self._initialized = False
+        self._init_event = threading.Event()
+        self._registered_buffers: Dict[int, int] = {}
+        self._host_buffer_pool: Optional[HostBufferPool] = None
+        self._async_put_manager: Optional[AsyncPutManager] = None
+        self._gpu_receive_buffer: Optional[GPUReceiveBuffer] = None
+        self._gpu_send_buffer: Optional[GPUSendBuffer] = None
+        self._gpu_direct_available = False
+        self._copy_stream: Optional[torch.cuda.Stream] = None
+        self._replicate_config: Any = None
+
+    def setup(self, device: torch.device | int | None = None) -> None:
+        if self._initialized:
+            return
+
+        if device is not None and not isinstance(device, torch.device):
+            device = torch.device(device)
+
+        if self.config.protocol == "rdma" and not self.config.device_name:
+            logger.warning(
+                "RDMA protocol with empty device_name will use auto-discovery, "
+                "which may fail on hosts with mixed IB subnets."
+            )
+
+        self.config.apply_env_defaults()
+        self._store = MooncakeDistributedStore()
+        logger.info(
+            "Connecting to Mooncake master at %s, metadata server at %s",
+            self.config.master_server_address,
+            self.config.metadata_server,
+        )
+        result = self._store.setup(
+            local_hostname=self.config.local_hostname,
+            metadata_server=self.config.metadata_server,
+            global_segment_size=self.config.global_segment_size,
+            local_buffer_size=self.config.local_buffer_size,
+            protocol=self.config.protocol,
+            rdma_devices=self.config.device_name,
+            master_server_addr=self.config.master_server_address,
+        )
+        if result is not None and result != 0:
+            raise RuntimeError(
+                f"Failed to initialize Mooncake client (error={result}). "
+                f"Check that Mooncake master is running at {self.config.master_server_address} "
+                f"and metadata server is available at {self.config.metadata_server}"
+            )
+
+        self._verify_force_delete()
+        self._build_replicate_config()
+
+        pool_size = self.config.async_put_pool_size
+        if pool_size > 0:
+            self._host_buffer_pool = HostBufferPool(
+                buffer_size=self.config.host_buffer_size,
+                pool_size=pool_size,
+            )
+            self._host_buffer_pool.initialize()
+
+            for buf in self._host_buffer_pool._buffers:
+                self._register_buffer(buf.ptr, buf.size)
+
+            self._async_put_manager = AsyncPutManager(
+                store=self._store, max_workers=pool_size, replicate_config=self._replicate_config
+            )
+            logger.info("Async put manager created (pool_size=%d)", pool_size)
+
+        if self.config.enable_gpu_direct and torch.cuda.is_available():
+            self._setup_gpu_direct(device)
+
+        if torch.cuda.is_available():
+            cuda_device = device if device is not None else torch.device("cuda")
+            self._copy_stream = torch.cuda.Stream(device=cuda_device)
+            logger.info("DtoH copy stream created on %s", cuda_device)
+
+        self._initialized = True
+        self._init_event.set()
+        logger.info(
+            "Mooncake Store client initialized (protocol=%s, device=%s, gpu_direct=%s, pool_size=%d)",
+            self.config.protocol,
+            self.config.device_name or "(auto-discovery)",
+            self._gpu_direct_available,
+            pool_size,
+        )
+
+    def _setup_gpu_direct(self, device: torch.device = None) -> None:
+        try:
+            self._gpu_receive_buffer = GPUReceiveBuffer(
+                size=self.config.gpu_buffer_size,
+                device=device,
+            )
+            self._gpu_receive_buffer.initialize()
+
+            if not self._register_buffer(
+                self._gpu_receive_buffer.ptr, self._gpu_receive_buffer.size
+            ):
+                logger.warning("Failed to register GPU receive buffer with Mooncake")
+                self._gpu_receive_buffer.free()
+                self._gpu_receive_buffer = None
+                return
+
+            self._gpu_send_buffer = GPUSendBuffer(
+                size=self.config.host_buffer_size,
+                device=device,
+            )
+            self._gpu_send_buffer.initialize()
+
+            if not self._register_buffer(self._gpu_send_buffer.ptr, self._gpu_send_buffer.size):
+                logger.warning("Failed to register GPU send buffer with Mooncake")
+                self._gpu_send_buffer.free()
+                self._gpu_send_buffer = None
+
+            self._gpu_direct_available = True
+            send_desc = (
+                f"{self._gpu_send_buffer.size / (1024**2):.1f}MB"
+                if self._gpu_send_buffer
+                else "N/A"
+            )
+            logger.info(
+                "GPU Direct RDMA enabled: receive=%.1fMB, send=%s on %s",
+                self._gpu_receive_buffer.size / (1024**2),
+                send_desc,
+                device or "cuda",
+            )
+
+        except Exception as e:
+            logger.warning("Failed to setup GPU Direct RDMA: %s", e)
+            self._gpu_direct_available = False
+            if self._gpu_receive_buffer is not None:
+                self._gpu_receive_buffer.free()
+                self._gpu_receive_buffer = None
+            if self._gpu_send_buffer is not None:
+                self._gpu_send_buffer.free()
+                self._gpu_send_buffer = None
+
+    def _ensure_initialized(self, timeout: float = 30.0) -> None:
+        if self._init_event.is_set():
+            return
+        if not self._init_event.wait(timeout=timeout):
+            if not self._initialized:
+                self.setup()
+
+    def _register_buffer(self, buffer_ptr: int, size: int) -> bool:
+        if buffer_ptr in self._registered_buffers:
+            return True
+
+        try:
+            if hasattr(self._store, "register_buffer"):
+                result = self._store.register_buffer(buffer_ptr, size)
+                if result == 0:
+                    self._registered_buffers[buffer_ptr] = size
+                    logger.debug("Registered buffer at %#x, size=%s", buffer_ptr, size)
+                    return True
+                logger.warning("register_buffer returned error code: %s", result)
+                return False
+        except Exception as e:
+            logger.warning("Failed to register buffer: %s", e)
+
+        return False
+
+    def warmup_rdma(self) -> None:
+        import uuid
+
+        self._ensure_initialized()
+        if self._host_buffer_pool is None:
+            logger.debug("Skipping RDMA warmup — no host buffer pool (get-only store)")
+            return
+        key = f"_warmup_{uuid.uuid4().hex[:8]}"
+        buf = self._host_buffer_pool.get_buffer()
+        size = 4096
+        self._store.batch_put_from([key], [buf.ptr], [size])
+        self._store.batch_remove([key], force=True)
+        logger.info("RDMA warmup complete")
+
+    def exists(self, key: str) -> bool:
+        try:
+            result = self._store.is_exist(key)
+            return result == 1
+        except Exception:
+            return False
+
+    def _verify_force_delete(self) -> None:
+        batch_remove = getattr(self._store, "batch_remove", None)
+        if batch_remove is None:
+            raise RuntimeError(
+                "Mooncake version too old: batch_remove() not found. "
+                "Requires mooncake-transfer-engine >= 0.3.10.post1."
+            )
+        try:
+            from importlib.metadata import version
+
+            from packaging.version import Version
+
+            installed = Version(version("mooncake-transfer-engine"))
+            if installed >= Version("0.3.10.post1"):
+                return
+        except Exception:
+            pass
+        doc = getattr(batch_remove, "__doc__", "") or ""
+        if "force" not in doc:
+            raise RuntimeError(
+                "Mooncake version too old: batch_remove(force=True) not supported. "
+                "Requires mooncake-transfer-engine >= 0.3.10.post1."
+            )
+
+    def _build_replicate_config(self) -> None:
+        self._replicate_config = None
+        if not self.config.enable_hard_pin:
+            return
+        try:
+            from mooncake.store import ReplicateConfig
+
+            cfg = ReplicateConfig()
+            if hasattr(cfg, "with_hard_pin"):
+                cfg.with_hard_pin = True
+                self._replicate_config = cfg
+                logger.info("Hard pin enabled for batch_put_from")
+            else:
+                logger.warning(
+                    "enable_hard_pin=True but ReplicateConfig lacks with_hard_pin attr"
+                )
+        except ImportError:
+            logger.warning("enable_hard_pin=True but ReplicateConfig not importable")
+
+    def close(self) -> None:
+        if self._async_put_manager is not None:
+            self._async_put_manager.shutdown()
+            self._async_put_manager = None
+        if self._gpu_send_buffer is not None:
+            self._gpu_send_buffer.free()
+            self._gpu_send_buffer = None
+        if self._gpu_receive_buffer is not None:
+            self._gpu_receive_buffer.free()
+            self._gpu_receive_buffer = None
+        if self._host_buffer_pool is not None:
+            self._host_buffer_pool.shutdown()
+            self._host_buffer_pool = None
+        self._copy_stream = None
+        if self._store is not None and hasattr(self._store, "close"):
+            self._store.close()
+        self._initialized = False
+        self._init_event.clear()
+        self._gpu_direct_available = False

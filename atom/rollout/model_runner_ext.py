@@ -200,8 +200,8 @@ class RLHFModelRunner(ModelRunner, WeightUpdaterMixin, MemoryManagerMixin):
             mooncake_config: Dict with Mooncake connection parameters
                 (``local_hostname``, ``metadata_server``, ``protocol``, etc.).
         """
-        from torchspec.config.mooncake_config import MooncakeConfig
-        from torchspec.transfer.mooncake.eagle_store import EagleMooncakeStore
+        from atom.transfer.mooncake_config import MooncakeConfig
+        from atom.transfer.eagle_store import EagleMooncakeStore
 
         self._aux_layer_ids = set(aux_layer_ids)
         mc_cfg = MooncakeConfig(**mooncake_config)
