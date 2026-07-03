@@ -1723,6 +1723,27 @@ class ModelRunner:
                 model_output = self.model(input_ids, positions)
                 if self.use_aux_hidden_state_outputs:
                     hidden_states, self._aux_hidden_states = model_output
+                    if not hasattr(self, "_dbg_aux_n"):
+                        self._dbg_aux_n = 0
+                    if self._dbg_aux_n < 5:
+                        import logging as _logging
+                        _lg = _logging.getLogger("atom")
+                        _lg.warning(
+                            f"[RunModel DBG #{self._dbg_aux_n}] "
+                            f"model_output type={type(model_output)}, "
+                            f"aux_hidden_states={type(self._aux_hidden_states)}, "
+                            f"is_list={isinstance(self._aux_hidden_states, list)}, "
+                            f"len={len(self._aux_hidden_states) if isinstance(self._aux_hidden_states, list) else 'N/A'}, "
+                            f"hidden_states shape={hidden_states.shape}"
+                        )
+                        if isinstance(self._aux_hidden_states, list):
+                            for ai, ahs in enumerate(self._aux_hidden_states):
+                                _lg.warning(
+                                    f"  aux[{ai}]: shape={ahs.shape}, "
+                                    f"min={ahs.float().min().item():.4f}, "
+                                    f"max={ahs.float().max().item():.4f}"
+                                )
+                        self._dbg_aux_n += 1
                 else:
                     hidden_states = model_output
                     self._aux_hidden_states = None
@@ -1856,6 +1877,24 @@ class ModelRunner:
                 self.tokenID_processor.prev_token_ids = next_token_ids
                 # self.debug(f"{sampled_tokens=}")
                 # self.debug(f"{next_token_locs=}")
+                if not hasattr(self, "_dbg_propose_call_n"):
+                    self._dbg_propose_call_n = 0
+                if self._dbg_propose_call_n < 5:
+                    import logging as _logging
+                    _lg = _logging.getLogger("atom")
+                    _lg.warning(
+                        f"[Propose Call DBG #{self._dbg_propose_call_n}] "
+                        f"_aux_hidden_states type={type(self._aux_hidden_states)}, "
+                        f"is None={self._aux_hidden_states is None}, "
+                        f"is_list={isinstance(self._aux_hidden_states, list)}"
+                    )
+                    if isinstance(self._aux_hidden_states, list):
+                        for ai, ahs in enumerate(self._aux_hidden_states):
+                            _lg.warning(
+                                f"  pre-propose aux[{ai}]: shape={ahs.shape}, "
+                                f"dtype={ahs.dtype}"
+                            )
+                    self._dbg_propose_call_n += 1
                 draft_token_ids = self.propose_draft_token_ids(
                     batch,
                     self.tokenID_processor.input_ids.gpu[

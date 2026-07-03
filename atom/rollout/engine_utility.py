@@ -30,6 +30,9 @@ class EngineUtilityHandler:
         "resume_memory": "_handle_resume_memory",
         "clear_kv_cache": "_handle_clear_kv_cache",
         "configure_hidden_states": "_handle_configure_hidden_states",
+        "enable_generate_extract_mode": "_handle_enable_generate_extract_mode",
+        "disable_generate_extract_mode": "_handle_disable_generate_extract_mode",
+        "flush_generate_extract": "_handle_flush_generate_extract",
     }
 
     def __init__(self, runner_mgr, output_queue, label: str = "Engine Core"):
@@ -199,13 +202,40 @@ class EngineUtilityHandler:
         """Configure hidden states extraction on all model runners (TorchSpec)."""
         aux_layer_ids = args.get("aux_layer_ids", [])
         mooncake_config = args.get("mooncake_config", {})
+        capture_mode = args.get("capture_mode", "postnorm")
         result = self.runner_mgr.call_func(
-            "configure_hidden_states", aux_layer_ids, mooncake_config, wait_out=True
+            "configure_hidden_states", aux_layer_ids, mooncake_config, capture_mode, wait_out=True
         )
         logger.info(
             f"{self.label}: configure_hidden_states completed, "
-            f"aux_layers={aux_layer_ids}"
+            f"aux_layers={aux_layer_ids}, capture_mode={capture_mode}"
         )
         self.output_queue.put_nowait(
             ("UTILITY_RESPONSE", {"cmd": "configure_hidden_states", "result": result})
+        )
+
+    def _handle_enable_generate_extract_mode(self, args: dict):
+        """Enable generate+extract mode on all model runners."""
+        result = self.runner_mgr.call_func("enable_generate_extract_mode", wait_out=True)
+        logger.info(f"{self.label}: generate+extract mode enabled on all runners")
+        self.output_queue.put_nowait(
+            ("UTILITY_RESPONSE", {"cmd": "enable_generate_extract_mode", "result": result})
+        )
+
+    def _handle_disable_generate_extract_mode(self, args: dict):
+        """Disable generate+extract mode on all model runners."""
+        result = self.runner_mgr.call_func("disable_generate_extract_mode", wait_out=True)
+        logger.info(f"{self.label}: generate+extract mode disabled on all runners")
+        self.output_queue.put_nowait(
+            ("UTILITY_RESPONSE", {"cmd": "disable_generate_extract_mode", "result": result})
+        )
+
+    def _handle_flush_generate_extract(self, args: dict):
+        """Flush accumulated hidden states from generate+extract mode."""
+        result = self.runner_mgr.call_func(
+            "flush_generate_extract", wait_out=True
+        )
+        logger.info(f"{self.label}: flush_generate_extract completed")
+        self.output_queue.put_nowait(
+            ("UTILITY_RESPONSE", {"cmd": "flush_generate_extract", "result": result})
         )

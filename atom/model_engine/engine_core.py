@@ -17,7 +17,7 @@ from atom.model_engine.async_proc import AsyncIOProcManager
 from atom.rollout.engine_utility import EngineUtilityHandler
 from atom.model_engine.scheduler import Scheduler
 from atom.model_engine.sequence import Sequence, SequenceStatus, get_exit_sequence
-from atom.utils import init_exit_handler, make_zmq_socket
+from atom.utils import envs, init_exit_handler, make_zmq_socket
 from atom.utils.distributed.utils import (
     stateless_destroy_torch_distributed_process_group,
 )
@@ -57,14 +57,9 @@ class EngineCore:
         self.stream_output_queue = (
             queue.Queue()
         )  # Queue for streaming intermediate outputs
-        # Queue for utility commands (processed in busy_loop to avoid thread contention)
         self.utility_queue = queue.Queue()
-        self._has_pending_utility = (
-            False  # Flag to avoid checking empty queue every loop
-        )
-        self._is_rl_weights_offloaded = (
-            False  # True when weights are offloaded for RL training
-        )
+        self._has_pending_utility = False
+        self._is_rl_weights_offloaded = False
         self.input_address = input_address
         self.output_address = output_address
         self.output_thread = threading.Thread(
@@ -90,15 +85,18 @@ class EngineCore:
         self._init_data_parallel(config)
 
         # Initialize model runner processes
+        runner_qualname = getattr(
+            config, "runner_qualname",
+            "atom.model_engine.model_runner.ModelRunner",
+        )
         try:
             good = False
             self.runner_mgr = AsyncIOProcManager(
                 self._finalizer,
                 config.tensor_parallel_size,
-                config.runner_qualname,
+                runner_qualname,
                 config,
             )
-
             block_info = self.runner_mgr.call_func("get_num_blocks", wait_out=True)
             num_blocks = block_info["num_kvcache_blocks"]
             config.per_req_cache_equiv_blocks = block_info.get(
@@ -114,6 +112,7 @@ class EngineCore:
 
             config.num_kvcache_blocks = num_blocks
             if not config.enforce_eager:
+                # Start profiler before cudagraph capture only if mark-trace is enabled.
                 if self.profile_enbaled and self.mark_trace:
                     self.runner_mgr.call_func(
                         "start_profiler", "capture_graph", wait_out=True
@@ -125,6 +124,7 @@ class EngineCore:
                     f"{self.label}: cudagraph capture{bs} cost: {cap_cost:.2f} seconds"
                 )
                 if self.profile_enbaled and self.mark_trace:
+                    # Persist a dedicated capture-graph trace immediately.
                     self.runner_mgr.call_func("stop_profiler", wait_out=True)
             good = True
         finally:
@@ -196,11 +196,6 @@ class EngineCore:
                 engine.exit()
 
     def _is_idle_rl_weights_offloaded(self) -> bool:
-        """Check if weights are offloaded for RL training.
-
-        When offloaded, busy-wait with a short delay to avoid CPU spin.
-        Returns True if the caller should skip model execution this tick.
-        """
         if self._is_rl_weights_offloaded:
             time.sleep(0.01)
             return True
@@ -220,12 +215,33 @@ class EngineCore:
 
     def _process_engine_step(self):
         result = self.scheduler.schedule()
+
+        # Surface admit-rejected seqs (those `_unschedulable_reason` flags in
+        # the scheduler) through the same finished-seq path as normal seqs.
+        # Without this, `llm.generate()` blocks forever waiting for an output
+        # the rejected seq will never produce.
+        rejected = getattr(self.scheduler, "take_rejected", None)
+        if rejected is not None:
+            rejected_seqs = rejected()
+            if rejected_seqs:
+                self.output_queue.put_nowait(rejected_seqs)
+
         if result is None:
+            if self.kv_transfer_enabled:
+                kvoutput = self.runner_mgr.call_func_with_aggregation(
+                    "async_proc_aggregation"
+                )
+                self.scheduler._update_from_kv_xfer_finished(kvoutput)
             return False
         scheduled_batch, seqs = result
 
         if scheduled_batch is None:
             logger.debug("%s: No sequences to schedule, skipping forward", self.label)
+            if self.kv_transfer_enabled:
+                kvoutput = self.runner_mgr.call_func_with_aggregation(
+                    "async_proc_aggregation"
+                )
+                self.scheduler._update_from_kv_xfer_finished(kvoutput)
             return False
 
         # Dispatch KV connector metadata to workers (triggers async KV load)
@@ -258,7 +274,9 @@ class EngineCore:
         seqs = seqs.values()
         # Pass stream_output_queue to postprocess for streaming callbacks
         finished_seqs = self.scheduler.postprocess(
-            seqs, fwd_out, stream_output_queue=self.stream_output_queue
+            seqs,
+            fwd_out,
+            stream_output_queue=self.stream_output_queue,
         )
 
         # Send stream outputs to main process via output_queue
@@ -315,8 +333,6 @@ class EngineCore:
                         )
                         self.input_queue.put_nowait(reqs)
                     elif request_type == EngineCoreRequestType.UTILITY:
-                        # Put utility commands into queue for processing in busy_loop
-                        # This ensures all runner_mgr.call_func() calls happen in the same thread
                         cmd = reqs.get("cmd") if isinstance(reqs, dict) else None
                         logger.debug(f"{self.label}: input get UTILITY command: {cmd}")
                         if cmd == "start_profile":
@@ -329,7 +345,6 @@ class EngineCore:
                             response = {"cmd": cmd, "result": self.get_mtp_statistics()}
                             self.output_queue.put_nowait(("UTILITY_RESPONSE", response))
                         else:
-                            # Queue command for processing in busy_loop (main thread)
                             self.utility_queue.put_nowait((cmd, reqs))
                             self._has_pending_utility = True
                     elif request_type == EngineCoreRequestType.SHUTDOWN:
@@ -364,7 +379,6 @@ class EngineCore:
                     continue
 
                 if isinstance(item, tuple) and item[0] == "UTILITY_RESPONSE":
-                    # Send utility command response back to CoreManager
                     response_data = item[1]
                     serialized_obj = pickle.dumps(
                         (EngineCoreRequestType.UTILITY_RESPONSE, response_data)
@@ -427,6 +441,19 @@ class DPEngineCoreProc(EngineCore):
         self.engines_running = True
         self._shutting_down = False
 
+        if envs.ATOM_ENABLE_PREFILL_DELAYER:
+            from atom.model_engine.prefill_delayer import PrefillDelayer
+
+            self.scheduler.set_prefill_delayer(
+                PrefillDelayer(
+                    dp_size=config.parallel_config.data_parallel_size,
+                    cpu_group=self.dp_group,
+                    max_delay_passes=envs.ATOM_PREFILL_DELAYER_MAX_DELAY_PASSES,
+                    max_delay_ms=envs.ATOM_PREFILL_DELAYER_MAX_DELAY_MS,
+                    token_usage_low_watermark=envs.ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK,
+                )
+            )
+
     def _init_data_parallel(self, config: Config):
         dp_rank = config.parallel_config.data_parallel_rank
         dp_size = config.parallel_config.data_parallel_size
@@ -438,6 +465,10 @@ class DPEngineCoreProc(EngineCore):
 
         self.dp_rank = dp_rank
         self.dp_group = config.parallel_config.stateless_init_dp_group()
+        # NOTE: PrefillDelayer attachment lives in __init__ (after
+        # super().__init__ creates self.scheduler) — not here. This
+        # function runs during super().__init__, before self.scheduler
+        # exists.
 
     def exit(self):
         super().exit()
@@ -445,16 +476,6 @@ class DPEngineCoreProc(EngineCore):
             stateless_destroy_torch_distributed_process_group(dp_group)
 
     def _gather_local_dp_state(self) -> tuple[bool, int, int, bool, bool]:
-        """Gather local scheduling state, substituting dummy values when
-        weights are offloaded for RL training.
-
-        Offloaded cores must still participate in _sync_dp_state (NCCL
-        all_reduce) to prevent other DP ranks from blocking forever.
-        The offload flag is included in the sync tensor so that ALL cores
-        agree to skip model execution together — MoE expert routing and
-        dummy_execution also contain DP-wide collectives that would hang
-        if only some cores participated.
-        """
         offloaded = self._is_rl_weights_offloaded
         if not offloaded:
             is_prefill, num_tokens, num_reqs = self.scheduler.get_next_batch_info()
@@ -508,11 +529,9 @@ class DPEngineCoreProc(EngineCore):
                 continue
 
             if global_has_prefill and not local_is_prefill:
-                # We must do dummy prefill to sync here
-                # Since we want to split mori output in moe, we need to make dp all run prefill or all run decode
                 dummy_reqs = min(
                     global_max_reqs, 2
-                )  # dummy reqs at 2: just enough for TBO agreement, avoid wasting compute.
+                )
                 logger.info(
                     f"{self.label}: Running dummy prefill ({global_max_tokens} tokens, {dummy_reqs} reqs) "
                     f"to sync with other DP ranks doing prefill"
@@ -522,10 +541,6 @@ class DPEngineCoreProc(EngineCore):
                 executed = self._process_engine_step()
                 if not executed:
                     if global_has_prefill:
-                        # get_next_batch_info predicted prefill but schedule()
-                        # skipped it (e.g. WAITING_FOR_REMOTE_KVS).  Other DP
-                        # ranks already committed to dummy_prefill, so we must
-                        # match to keep the all-reduce in sync.
                         logger.info(
                             f"{self.label}: Predicted prefill was not scheduled, "
                             f"falling back to dummy prefill ({global_max_tokens} "
@@ -565,7 +580,6 @@ class DPEngineCoreProc(EngineCore):
             )
 
         try:
-            # Pack all state: [is_prefill, num_tokens, num_reqs, has_unfinished, shutdown, offloaded]
             state_tensor = torch.tensor(
                 [
                     1 if local_is_prefill else 0,

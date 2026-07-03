@@ -336,6 +336,33 @@ class EagleProposer:
         else:
             hidden_states = target_hidden_states
 
+        if not hasattr(self, "_dbg_propose_n"):
+            self._dbg_propose_n = 0
+        _do_dbg = self._dbg_propose_n < 10
+        if _do_dbg and not context.is_prefill:
+            _li = last_token_indices[0].item() if len(last_token_indices) > 0 else -1
+            _iid = input_ids[_li].item() if _li >= 0 else -1
+            if aux_hidden_states is not None:
+                _aux_norms = [ahs[_li:_li+1].float().norm(dim=-1).item() for ahs in aux_hidden_states]
+                _aux_maxs = [ahs[_li:_li+1].float().abs().max().item() for ahs in aux_hidden_states]
+            else:
+                _aux_norms = []
+                _aux_maxs = []
+            _ctx_lens = attn_metadata.context_lens[:bs].tolist() if hasattr(attn_metadata, 'context_lens') else 'N/A'
+            _max_sq = attn_metadata.max_seqlen_q if hasattr(attn_metadata, 'max_seqlen_q') else 'N/A'
+            _max_sk = attn_metadata.max_seqlen_k if hasattr(attn_metadata, 'max_seqlen_k') else 'N/A'
+            _slot_map = attn_metadata.slot_mapping[:min(8,len(attn_metadata.slot_mapping))].tolist() if hasattr(attn_metadata, 'slot_mapping') else 'N/A'
+            logger.warning(
+                f"[Eagle3 DBG propose#{self._dbg_propose_n}] "
+                f"bs={bs}, input_ids[last_idx={_li}]={_iid}, "
+                f"n_tokens={len(input_ids)}, "
+                f"positions={positions[:min(4,len(positions))].tolist()}, "
+                f"context_lens={_ctx_lens}, max_sq={_max_sq}, max_sk={_max_sk}, "
+                f"slot_mapping={_slot_map}, "
+                f"aux_norms={[f'{n:.0f}' for n in _aux_norms]}, "
+                f"aux_maxs={[f'{m:.0f}' for m in _aux_maxs]}"
+            )
+
         draft_token_ids = torch.empty(
             bs, self.mtp_k, dtype=next_token_ids.dtype, device=next_token_ids.device
         )
@@ -356,6 +383,18 @@ class EagleProposer:
 
         for i in range(self.mtp_k):
             with record_function(f"draft[{i}/{self.mtp_k} bs={bs}]"):
+                if _do_dbg and not context.is_prefill:
+                    _idx = last_token_indices[0].item() if i == 0 else 0
+                    _hs = hidden_states[_idx].float()
+                    _emb = self.model.embed_tokens(input_ids[_idx:_idx+1])[0].float()
+                    logger.warning(
+                        f"  step={i} INPUTS: input_id={input_ids[_idx].item()}, "
+                        f"pos={positions[_idx].item()}, "
+                        f"hs_norm={_hs.norm().item():.1f}, "
+                        f"hs_first5={_hs[:5].tolist()}, "
+                        f"emb_norm={_emb.norm().item():.1f}, "
+                        f"emb_first5={_emb[:5].tolist()}"
+                    )
                 model_output = self.model(
                     input_ids=input_ids,
                     positions=positions,
@@ -378,6 +417,22 @@ class EagleProposer:
                 logits = self.model.compute_logits(sample_hidden_states)
                 new_draft_ids = logits.argmax(dim=-1)
                 draft_token_ids[:, i] = new_draft_ids
+
+                if _do_dbg:
+                    top3 = logits[0].topk(3)
+                    _sh = sample_hidden_states[0].float()
+                    _rh = ret_hidden_states[0 if i > 0 else last_token_indices[0].item()].float()
+                    _rp = ret_hidden_prenorm[0 if i > 0 else last_token_indices[0].item()].float() if ret_hidden_prenorm is not None else None
+                    _rp_str = f"{_rp.norm().item():.1f}" if _rp is not None else "N/A"
+                    logger.warning(
+                        f"  step={i}: draft={new_draft_ids[0].item()}, "
+                        f"top3={top3.indices.tolist()}, "
+                        f"std={logits[0].float().std().item():.4f}, "
+                        f"sample_hs_norm={_sh.norm().item():.1f}, "
+                        f"sample_hs_first5={_sh[:5].tolist()}, "
+                        f"ret_hs_norm={_rh.norm().item():.1f}, "
+                        f"ret_prenorm_norm={_rp_str}"
+                    )
 
                 if i < self.mtp_k - 1:
                     do_attn_metadata_update = (
@@ -451,7 +506,8 @@ class EagleProposer:
                     else:
                         hidden_states = sample_hidden_states
 
-        # self.runner.debug(f"final {draft_token_ids=}")
+        if _do_dbg:
+            self._dbg_propose_n += 1
         # [batch_size, mtp_k]
         return draft_token_ids
 

@@ -10,7 +10,8 @@ import numpy as np
 import torch
 
 from aiter import init_dist_env
-from aiter.dist.parallel_state import get_tp_group
+from aiter.dist.communication_op import tensor_model_parallel_all_reduce
+from aiter.dist.parallel_state import get_tensor_model_parallel_rank, get_tp_group
 from aiter.dist.utils import get_distributed_init_method
 from atom.model_engine.model_runner import ModelRunner
 from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
@@ -108,6 +109,7 @@ class RLHFModelRunner(ModelRunner, WeightUpdaterMixin, MemoryManagerMixin):
             ca_comm.buffer = ca_comm._pool["input"].tensor
 
     _extract_mode: bool = False
+    _generate_extract_mode: bool = False
 
     def _model_forward_accepts_capture_arg(self) -> bool:
         signature = inspect.signature(self.model.forward)
@@ -119,16 +121,10 @@ class RLHFModelRunner(ModelRunner, WeightUpdaterMixin, MemoryManagerMixin):
     def _find_decoder_layers_for_capture(self):
         candidates = (
             ("model.layers", self.model, ("model", "layers")),
-            (
-                "language_model.model.layers",
-                self.model,
-                ("language_model", "model", "layers"),
-            ),
-            (
-                "model.language_model.model.layers",
-                self.model,
-                ("model", "language_model", "model", "layers"),
-            ),
+            ("language_model.model.layers", self.model,
+             ("language_model", "model", "layers")),
+            ("model.language_model.model.layers", self.model,
+             ("model", "language_model", "model", "layers")),
         )
         for name, root, path in candidates:
             module = root
@@ -141,8 +137,8 @@ class RLHFModelRunner(ModelRunner, WeightUpdaterMixin, MemoryManagerMixin):
                 return module
         return None
 
-    def _register_hidden_state_hooks(self) -> bool:
-        if self._model_forward_accepts_capture_arg():
+    def _register_hidden_state_hooks(self, force: bool = False) -> bool:
+        if not force and self._model_forward_accepts_capture_arg():
             return False
 
         layers = self._find_decoder_layers_for_capture()
@@ -167,8 +163,11 @@ class RLHFModelRunner(ModelRunner, WeightUpdaterMixin, MemoryManagerMixin):
                     hidden_states, residual = output[0], output[1]
                     if isinstance(hidden_states, tuple):
                         hidden_states = hidden_states[0]
+                    hidden_states = tensor_model_parallel_all_reduce(hidden_states)
                     if residual is not None:
-                        hidden_states = hidden_states + residual
+                        hidden_states = (hidden_states.float() + residual.float()).to(
+                            hidden_states.dtype
+                        )
                 else:
                     hidden_states = output
 
@@ -188,7 +187,7 @@ class RLHFModelRunner(ModelRunner, WeightUpdaterMixin, MemoryManagerMixin):
 
         return bool(self._hidden_state_hook_handles)
 
-    def configure_hidden_states(self, aux_layer_ids, mooncake_config):
+    def configure_hidden_states(self, aux_layer_ids, mooncake_config, capture_mode="postnorm"):
         """Enable hidden states extraction for TorchSpec.
 
         Called via utility command. When not called, ``_extract_mode`` stays
@@ -199,11 +198,15 @@ class RLHFModelRunner(ModelRunner, WeightUpdaterMixin, MemoryManagerMixin):
                 should be captured (e.g. ``[1, 15, 28]``).
             mooncake_config: Dict with Mooncake connection parameters
                 (``local_hostname``, ``metadata_server``, ``protocol``, etc.).
+            capture_mode: ``"postnorm"`` (default, allreduce+residual+RMSNorm)
+                or ``"prenorm"`` (NV-style, allreduce+residual only — Eagle3's
+                hidden_norm handles normalization).
         """
         from atom.transfer.mooncake_config import MooncakeConfig
         from atom.transfer.eagle_store import EagleMooncakeStore
 
         self._aux_layer_ids = set(aux_layer_ids)
+        self._capture_mode = capture_mode
         mc_cfg = MooncakeConfig(**mooncake_config)
         self._mooncake_store = EagleMooncakeStore(mc_cfg)
         self._extract_mode = True
@@ -211,13 +214,40 @@ class RLHFModelRunner(ModelRunner, WeightUpdaterMixin, MemoryManagerMixin):
         self._captured_last_hidden_states: Optional[torch.Tensor] = None
         self._hook_capture_enabled = False
         self._hook_captured_hidden_states: dict[int, torch.Tensor] = {}
-        self._use_hook_capture = self._register_hidden_state_hooks()
+        if capture_mode == "prenorm":
+            self._use_hook_capture = self._register_hidden_state_hooks(force=True)
+        elif capture_mode == "varnorm":
+            self._use_hook_capture = self._register_hidden_state_hooks()
+            model_inner = getattr(self.model, "model", None)
+            if model_inner is not None and hasattr(model_inner, "_capture_mode"):
+                model_inner._capture_mode = "varnorm"
+        else:
+            self._use_hook_capture = self._register_hidden_state_hooks()
         logger.info(
             f"{self.label}: hidden states extraction enabled, "
             f"aux_layers={sorted(self._aux_layer_ids)}, "
-            f"hook_capture={self._use_hook_capture}"
+            f"hook_capture={self._use_hook_capture}, "
+            f"capture_mode={self._capture_mode}"
         )
         return sorted(self._aux_layer_ids)
+
+    def enable_generate_extract_mode(self):
+        """Enable generate+extract mode: capture hidden states during decode too."""
+        self._generate_extract_mode = True
+        self._gen_extract_accum: dict[str, dict[str, list[torch.Tensor]]] = {}
+        logger.info(f"{self.label}: generate+extract mode enabled")
+        if get_tensor_model_parallel_rank() == 0:
+            return True
+        return None
+
+    def disable_generate_extract_mode(self):
+        """Disable generate+extract mode and clear accumulators."""
+        self._generate_extract_mode = False
+        self._gen_extract_accum = {}
+        logger.info(f"{self.label}: generate+extract mode disabled")
+        if get_tensor_model_parallel_rank() == 0:
+            return True
+        return None
 
     def run_model(
         self,
@@ -230,7 +260,7 @@ class RLHFModelRunner(ModelRunner, WeightUpdaterMixin, MemoryManagerMixin):
         forward_context = get_forward_context()
         context = forward_context.context
 
-        if context.is_prefill:
+        if context.is_prefill or self._generate_extract_mode:
             positions = context.positions
             if getattr(self, "_use_hook_capture", False):
                 self._hook_captured_hidden_states = {}
@@ -251,9 +281,15 @@ class RLHFModelRunner(ModelRunner, WeightUpdaterMixin, MemoryManagerMixin):
                 else:
                     hidden_states = result
                     captured = {}
+
+            for lid in list(captured.keys()):
+                t = captured[lid]
+                if torch.isnan(t).any() or torch.isinf(t).any():
+                    captured[lid] = t.nan_to_num_(0.0, posinf=0.0, neginf=0.0)
+
             logits = self.model.compute_logits(hidden_states)
             self._captured_hidden_states = captured
-            self._captured_last_hidden_states = hidden_states.detach()
+            self._captured_last_hidden_states = hidden_states.clone().detach()
             return logits, hidden_states
 
         return super().run_model(input_ids, batch)
@@ -263,7 +299,10 @@ class RLHFModelRunner(ModelRunner, WeightUpdaterMixin, MemoryManagerMixin):
         result = super().forward(batch)
 
         if self._extract_mode and self._captured_hidden_states is not None:
-            self._store_hidden_states(batch)
+            if self._generate_extract_mode:
+                self._accumulate_hidden_states(batch)
+            else:
+                self._store_hidden_states(batch)
             self._captured_hidden_states = None
             self._captured_last_hidden_states = None
 
@@ -271,12 +310,64 @@ class RLHFModelRunner(ModelRunner, WeightUpdaterMixin, MemoryManagerMixin):
 
     def _store_hidden_states(self, batch: ScheduledBatch):
         """Write captured hidden states to Mooncake store, one entry per request."""
+        if get_tensor_model_parallel_rank() != 0:
+            return
+
         captured = self._captured_hidden_states
         last_hs = self._captured_last_hidden_states
         if not captured:
             return
 
         sorted_layers = sorted(captured.keys())
+
+        if not hasattr(self, "_nan_diag_count"):
+            self._nan_diag_count = 0
+        if self._nan_diag_count < 5:
+            num_scheduled = batch.num_scheduled_tokens
+            offsets = np.cumsum(num_scheduled)
+            logger.warning(
+                f"{self.label}: === NaN DIAG batch {self._nan_diag_count} === "
+                f"capture_mode={getattr(self, '_capture_mode', 'postnorm')}, "
+                f"total_tokens={int(offsets[-1])}, num_seqs={len(batch.req_ids)}, "
+                f"seq_lens={list(num_scheduled[:min(8, len(num_scheduled))])}"
+            )
+            for lid in sorted_layers:
+                hs = captured[lid]
+                nan_rows = torch.isnan(hs).any(dim=-1)
+                nan_pct = 100 * nan_rows.float().mean().item()
+                mx = hs.abs().nan_to_num(0).max().item()
+                per_seq = []
+                start = 0
+                for si in range(min(len(num_scheduled), 8)):
+                    end = int(offsets[si])
+                    seq_nan = nan_rows[start:end]
+                    nz = torch.nonzero(seq_nan, as_tuple=False)
+                    first = int(nz[0].item()) if nz.numel() > 0 else -1
+                    cnt = int(nz.numel())
+                    per_seq.append(f"s{si}({num_scheduled[si]}):@{first}/{cnt}")
+                    start = end
+                logger.warning(
+                    f"{self.label}: L{lid} nan={nan_pct:.0f}% max={mx:.0f} "
+                    f"shape={tuple(hs.shape)} | " + " ".join(per_seq)
+                )
+            if last_hs is not None:
+                nan_rows = torch.isnan(last_hs).any(dim=-1)
+                nan_pct = 100 * nan_rows.float().mean().item()
+                per_seq = []
+                start = 0
+                for si in range(min(len(num_scheduled), 8)):
+                    end = int(offsets[si])
+                    seq_nan = nan_rows[start:end]
+                    nz = torch.nonzero(seq_nan, as_tuple=False)
+                    first = int(nz[0].item()) if nz.numel() > 0 else -1
+                    cnt = int(nz.numel())
+                    per_seq.append(f"s{si}({num_scheduled[si]}):@{first}/{cnt}")
+                    start = end
+                logger.warning(
+                    f"{self.label}: last_hs nan={nan_pct:.0f}% | " + " ".join(per_seq)
+                )
+            self._nan_diag_count += 1
+
         aux_hs = torch.cat([captured[lid] for lid in sorted_layers], dim=-1)
 
         num_scheduled = batch.num_scheduled_tokens
@@ -304,3 +395,70 @@ class RLHFModelRunner(ModelRunner, WeightUpdaterMixin, MemoryManagerMixin):
                 last_hidden_states=last_hs[start:end],
             )
             start = end
+
+    def _accumulate_hidden_states(self, batch: ScheduledBatch):
+        """Accumulate hidden states per request during generate+extract mode."""
+        if get_tensor_model_parallel_rank() != 0:
+            return
+
+        captured = self._captured_hidden_states
+        last_hs = self._captured_last_hidden_states
+        if not captured:
+            return
+
+        sorted_layers = sorted(captured.keys())
+        aux_hs = torch.cat([captured[lid] for lid in sorted_layers], dim=-1)
+
+        num_scheduled = batch.num_scheduled_tokens
+        offsets = np.cumsum(num_scheduled)
+        start = 0
+        for i, req_id in enumerate(batch.req_ids):
+            end = int(offsets[i])
+            ext_id = batch.external_request_ids[i]
+            if ext_id is None:
+                start = end
+                continue
+
+            seq_input_ids = torch.from_numpy(
+                batch.scheduled_tokens[start:end].astype(np.int64)
+            ).to(self.device)
+
+            if ext_id not in self._gen_extract_accum:
+                self._gen_extract_accum[ext_id] = {
+                    "aux_hs": [], "last_hs": [], "ids": [],
+                }
+
+            accum = self._gen_extract_accum[ext_id]
+            accum["aux_hs"].append(aux_hs[start:end].clone().detach())
+            accum["last_hs"].append(last_hs[start:end].clone().detach())
+            accum["ids"].append(seq_input_ids)
+            start = end
+
+    def flush_generate_extract(self):
+        """Flush accumulated hidden states to Mooncake and return per-request seq_lens."""
+        if get_tensor_model_parallel_rank() != 0:
+            return None
+
+        seq_lens = {}
+        for ext_id, accum in self._gen_extract_accum.items():
+            if not accum["aux_hs"]:
+                continue
+
+            aux_hs = torch.cat(accum["aux_hs"], dim=0)
+            last_hs = torch.cat(accum["last_hs"], dim=0)
+            input_ids = torch.cat(accum["ids"], dim=0)
+            seq_lens[ext_id] = aux_hs.shape[0]
+
+            self._mooncake_store.put(
+                key=ext_id,
+                hidden_states=aux_hs,
+                input_ids=input_ids,
+                last_hidden_states=last_hs,
+            )
+
+        logger.info(
+            f"{self.label}: flushed generate+extract hidden states for "
+            f"{len(seq_lens)} requests"
+        )
+        self._gen_extract_accum.clear()
+        return seq_lens

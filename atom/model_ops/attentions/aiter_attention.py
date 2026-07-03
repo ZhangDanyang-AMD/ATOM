@@ -633,6 +633,30 @@ class AiterAttentionMetadataBuilder:
 
         return attn_metadata, positions
 
+    def prepare_mtp_decode(
+        self,
+        bs: int,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+        positions: "torch.Tensor" = None,
+        only_update: bool = False,
+        num_reject_tokens=None,
+    ):
+        var = self.model_runner.forward_vars
+        kv_indptr = var["kv_indptr"].gpu[: bs + 1]
+        kv_indices_generate_triton(
+            var["block_tables"].gpu[:bs],
+            var["kv_indices"].gpu,
+            kv_indptr,
+            self.block_ratio,
+            max_seqlen_k,
+        )
+
+        result = {}
+        if self.block_size == 1024:
+            result = self.set_aiter_persistent_worker_buffers(bs)
+        return result
+
     def _prepare_ubatch_decode(
         self,
         scheduled_bs: int,

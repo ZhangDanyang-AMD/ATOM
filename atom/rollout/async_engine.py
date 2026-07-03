@@ -82,22 +82,86 @@ class AsyncLLMEngine(LLMEngine):
         """
         load_weights_via_ipc(self.core_mgr, weights, bucket_size_mb, num_gpus=num_gpus)
 
-    def configure_hidden_states(self, aux_layer_ids, mooncake_config):
+    def configure_hidden_states(self, aux_layer_ids, mooncake_config, capture_mode="postnorm"):
         """Configure hidden states extraction on all model runners.
 
         Args:
             aux_layer_ids: Layer indices to capture (e.g. ``[1, 15, 28]``).
             mooncake_config: Dict passed to ``EagleMooncakeStore.__init__``.
+            capture_mode: ``"postnorm"`` or ``"prenorm"`` (NV-style, no RMSNorm).
         """
         self.core_mgr.broadcast_utility_command_sync(
             "configure_hidden_states",
             aux_layer_ids=aux_layer_ids,
             mooncake_config=mooncake_config,
+            capture_mode=capture_mode,
         )
         logger.info(
             f"AsyncLLMEngine: hidden states extraction configured, "
-            f"aux_layers={aux_layer_ids}"
+            f"aux_layers={aux_layer_ids}, capture_mode={capture_mode}"
         )
+
+    def generate_with_hidden_states(self, input_ids_list, data_ids, sampling_params=None):
+        """Generate responses AND extract hidden states in one pass.
+
+        Unlike generate_hidden_states() which does prefill-only (max_tokens=1),
+        this method runs full generation and captures hidden states at every
+        position (prefill + all decode steps). Hidden states are accumulated
+        per-request and flushed to Mooncake after generation completes.
+
+        Args:
+            input_ids_list: List of token id lists (prompt-only).
+            data_ids: List of data IDs used as Mooncake keys.
+            sampling_params: Optional SamplingParams for generation.
+
+        Returns:
+            List of dicts with metadata for each completed request.
+        """
+        from atom.sampling_params import SamplingParams
+
+        if sampling_params is None:
+            sampling_params = SamplingParams(max_tokens=2048, temperature=0.0)
+
+        self.core_mgr.broadcast_utility_command_sync("enable_generate_extract_mode")
+
+        prompts = [
+            ids if isinstance(ids, list) else ids.tolist() for ids in input_ids_list
+        ]
+
+        self.core_mgr._rr_counter = 0
+        self.add_request(prompts, sampling_params, request_ids=data_ids)
+
+        outputs = {}
+        while not self.is_finished() and (
+            self.core_mgr.is_alive() or self.core_mgr.is_rest()
+        ):
+            seqs = self.step()
+            outs = self.io_processor.postprocess(seqs)
+            outputs.update(outs)
+
+        responses = self.core_mgr.broadcast_utility_command_sync(
+            "flush_generate_extract"
+        )
+
+        seq_lens = {}
+        for resp in responses:
+            if isinstance(resp, dict):
+                result = resp.get("result")
+                if isinstance(result, dict):
+                    seq_lens.update(result)
+
+        self.core_mgr.broadcast_utility_command_sync("disable_generate_extract_mode")
+
+        results = []
+        for data_id in data_ids:
+            results.append(
+                {
+                    "mooncake_key": data_id,
+                    "data_id": data_id,
+                    "seq_len": seq_lens.get(data_id),
+                }
+            )
+        return results
 
     def generate_hidden_states(self, input_ids_list, data_ids):
         """Run prefill-only forward and extract hidden states to Mooncake.

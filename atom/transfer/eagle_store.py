@@ -94,7 +94,10 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
     ) -> Dict[str, Any]:
         self._ensure_initialized()
 
-        if hidden_states.dtype != HIDDEN_STATES_STORAGE_DTYPE:
+        if (
+            hidden_states is not None
+            and hidden_states.dtype != HIDDEN_STATES_STORAGE_DTYPE
+        ):
             hidden_states = hidden_states.to(HIDDEN_STATES_STORAGE_DTYPE)
         if (
             last_hidden_states is not None
@@ -221,7 +224,8 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
                 (
                     "last_hidden_states",
                     shapes["last_hidden_states"],
-                    dtypes.get("hidden_states", HIDDEN_STATES_STORAGE_DTYPE),
+                    dtypes.get("last_hidden_states",
+                               dtypes.get("hidden_states", HIDDEN_STATES_STORAGE_DTYPE)),
                 )
             )
 

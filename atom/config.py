@@ -605,6 +605,9 @@ def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConf
             hf_config = maybe_patch_hf_config_from_gguf(model, hf_config)
         else:
             raise e
+    for field, value in config_dict.items():
+        if not hasattr(hf_config, field):
+            setattr(hf_config, field, value)
     return hf_config
 
 
