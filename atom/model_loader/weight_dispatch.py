@@ -107,6 +107,12 @@ class WeightDispatcher:
         parameter is missing stops the search rather than falling through to
         the expert paths, which is what the original `break` did.
         """
+        # Native/packed-on-disk checkpoints may already use the runtime
+        # parameter name. Exact matches must reach the generic direct loader;
+        # substring rules such as ``up_proj`` also occur inside
+        # ``gate_up_proj`` and would otherwise rewrite the name a second time.
+        if name in self.params_dict:
+            return False
         for k in self.packed_modules_mapping:
             # We handle the experts below in expert_params_mapping
             if (

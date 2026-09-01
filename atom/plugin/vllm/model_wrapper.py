@@ -165,11 +165,16 @@ _ATOM_MODEL_CLASSES: dict[str, str] = {
     "Eagle3LlamaModel": "atom.models.eagle3_llama:Eagle3LlamaModel",
     "Eagle3DeepseekMLAModel": "atom.models.eagle3_deepseek_mla:Eagle3DeepseekMLAModel",
     "K3DSparkModel": "atom.plugin.vllm.models.kimi_k3_dspark:KimiK3DSparkDraft",
+    "AtomK3DSparkModel": (
+        "atom.plugin.vllm.models.kimi_k3_dspark:KimiK3DSparkDraft"
+    ),
 }
 
 # DSpark drafts ship as their own checkpoint, so like EAGLE3 they are built from
 # the draft's hf_config and their layers are numbered past the target's.
-_DSPARK_DRAFT_ARCHS: frozenset[str] = frozenset({"K3DSparkModel"})
+_DSPARK_DRAFT_ARCHS: frozenset[str] = frozenset(
+    {"K3DSparkModel", "AtomK3DSparkModel"}
+)
 
 
 def _normalize_atom_model_arch(model_arch: str) -> str:

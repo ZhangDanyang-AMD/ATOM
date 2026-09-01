@@ -120,15 +120,27 @@ def _dspark_markov_argmax_stage1(
         other=0.0,
     )
     vals = tl.where(v_mask[None, :], base.to(tl.float32) + acc, float("-inf"))
-    tile_max = tl.max(vals, axis=1)
+    # torch.argmax treats a NaN as greater than every numeric value and returns
+    # the first NaN. Preserve that behavior explicitly: `NaN == NaN` is false,
+    # so the ordinary equality-based tie break would otherwise emit the
+    # out-of-range `vocab_size` sentinel for an all-NaN warmup row.
+    is_nan = vals != vals
+    has_nan = tl.max(is_nan.to(tl.int32), axis=1) != 0
+    ordered_vals = tl.where(is_nan, float("-inf"), vals)
+    tile_max = tl.max(ordered_vals, axis=1)
+    wins = tl.where(has_nan[:, None], is_nan, ordered_vals == tile_max[:, None])
     # `& v_mask` also covers the all--inf row: without it a padded lane, which
     # is -inf too, could win the id.
     cand = tl.where(
-        (vals == tile_max[:, None]) & v_mask[None, :], offs_v[None, :], vocab_size
+        wins & v_mask[None, :], offs_v[None, :], vocab_size
     )
     tile_idx = tl.min(cand, axis=1)
+    # Carry NaN forward as the cross-tile priority marker. Summing only NaN
+    # lanes constructs a NaN without relying on a backend-specific literal.
+    nan_score = tl.sum(tl.where(is_nan, vals, 0.0), axis=1)
+    tile_score = tl.where(has_nan, nan_score, tile_max)
 
-    tl.store(part_val_ptr + tile * num_rows + offs_row, tile_max, mask=row_mask)
+    tl.store(part_val_ptr + tile * num_rows + offs_row, tile_score, mask=row_mask)
     tl.store(part_idx_ptr + tile * num_rows + offs_row, tile_idx, mask=row_mask)
 
 
@@ -154,8 +166,12 @@ def _dspark_markov_argmax_stage2(
     idxs = tl.load(
         part_idx_ptr + offs_tile * num_rows + row, mask=tile_mask, other=vocab_size
     )
-    best = tl.max(vals, axis=0)
-    cand = tl.where((vals == best) & tile_mask, idxs, vocab_size)
+    is_nan = vals != vals
+    has_nan = tl.max(is_nan.to(tl.int32), axis=0) != 0
+    ordered_vals = tl.where(is_nan, float("-inf"), vals)
+    best = tl.max(ordered_vals, axis=0)
+    wins = tl.where(has_nan, is_nan, ordered_vals == best)
+    cand = tl.where(wins & tile_mask, idxs, vocab_size)
     tl.store(out_ptr + row, tl.min(cand, axis=0).to(tl.int64))
 
 

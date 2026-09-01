@@ -123,6 +123,7 @@ support_draft_model_arch_dict = {
     "Eagle3LlamaModel": "atom.models.eagle3_llama.Eagle3LlamaModel",
     "Eagle3DeepseekMLAModel": "atom.models.eagle3_deepseek_mla.Eagle3DeepseekMLAModel",
     "K3DSparkModel": "atom.models.kimi_k3_dspark.KimiK3DSpark",
+    "AtomK3DSparkModel": "atom.models.kimi_k3_dspark.AtomK3DSparkModel",
 }
 
 

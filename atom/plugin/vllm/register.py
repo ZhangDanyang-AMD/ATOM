@@ -40,6 +40,9 @@ _VLLM_MODEL_REGISTRY_OVERRIDES: dict[str, str] = {
     ),
     # vLLM registers this arch too, but only to its NVIDIA implementation.
     "K3DSparkModel": "atom.plugin.vllm.models.kimi_k3_dspark:KimiK3DSparkVllm",
+    "AtomK3DSparkModel": (
+        "atom.plugin.vllm.models.kimi_k3_dspark:KimiK3DSparkVllm"
+    ),
     "MiniMaxM2ForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "DeepseekV4ForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "MiniMaxM3SparseForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
@@ -86,16 +89,23 @@ class MiniMaxM3Config(PretrainedConfig):
             setattr(text_config, name, value)
 
 
+class AtomK3DSparkConfig(PretrainedConfig):
+    """Private config shim for ATOM-native K3 DSpark checkpoints."""
+
+    model_type = "atom_k3_dspark"
+
+
 def _set_plugin_mode() -> None:
     _set_framework_backbone("vllm")
 
 
 def _register_hf_configs() -> None:
-    try:
-        AutoConfig.register(MiniMaxM3Config.model_type, MiniMaxM3Config)
-    except ValueError as exc:
-        if "already used by a Transformers config" not in str(exc):
-            raise
+    for config_cls in (MiniMaxM3Config, AtomK3DSparkConfig):
+        try:
+            AutoConfig.register(config_cls.model_type, config_cls)
+        except ValueError as exc:
+            if "already used by a Transformers config" not in str(exc):
+                raise
 
 
 def _register_mxfp8_quantization_config() -> None:

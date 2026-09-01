@@ -262,13 +262,24 @@ class DSparkProposer(Drafter):
         # hf_config / compilation_config are mutated here.
         import copy
 
-        from atom.config import CompilationLevel
+        from atom.config import CompilationLevel, QuantizationConfig
 
         draft_hf = self.speculative_config.draft_model_hf_config
         draft_atom_config = copy.copy(self.config)
         draft_atom_config.hf_config = draft_hf
         draft_atom_config.compilation_config = copy.copy(self.config.compilation_config)
         draft_atom_config.compilation_config.level = CompilationLevel.NO_COMPILATION
+        # A pre-quantized standalone draft declares its own weight and dynamic
+        # activation scheme in config.json. Use that metadata to allocate FP8
+        # parameters and select activation-quantizing kernels. A BF16 draft has
+        # no such metadata and must keep the established config path unchanged.
+        if getattr(draft_hf, "quantization_config", None) is not None:
+            draft_atom_config.quant_config = QuantizationConfig(draft_hf)
+            draft_atom_config.online_quant_config = None
+            logger.info(
+                "DSpark draft: using checkpoint-local quantization config (%s).",
+                draft_atom_config.quant_config.quant_method,
+            )
         model = model_class(
             draft_atom_config,
             layer_offset=self.config.hf_config.num_hidden_layers,

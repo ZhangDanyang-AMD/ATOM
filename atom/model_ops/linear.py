@@ -580,7 +580,9 @@ class LinearBase(nn.Module):
             self.bias.weight_loader = self.weight_loader
         if self.weight_scale is not None:
             self.weight_scale.weight_loader = self.weight_loader
-        self.need_normalize_e4m3fn_to_e4m3fnuz = params_dtype == torch.float8_e4m3fnuz
+        self.need_normalize_e4m3fn_to_e4m3fnuz = (
+            params_dtype == torch.float8_e4m3fnuz
+        )
         self.quant_func = get_hip_quant(self.quant_type)
         self.is_output_padded = False
 
@@ -2156,6 +2158,15 @@ class MergedReplicatedLinear(ReplicatedLinear):
         loaded_shard_id: Optional[int] = None,
     ):  # ？
         param_data = param.data
+        if loaded_shard_id is None:
+            if param_data.shape != loaded_weight.shape:
+                raise ValueError(
+                    f"{self.prefix}: fused checkpoint tensor shape "
+                    f"{tuple(loaded_weight.shape)} does not match parameter "
+                    f"shape {tuple(param_data.shape)}."
+                )
+            param.weight_loader_process(param_data, loaded_weight)
+            return
         assert loaded_shard_id is not None
         assert loaded_shard_id < len(self.output_sizes)
         if param is getattr(self, "weight_scale", None) or param is getattr(

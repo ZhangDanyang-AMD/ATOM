@@ -313,11 +313,15 @@ class QuantizationConfig:
             self.online_global_spec: LayerQuantConfig = LayerQuantConfig()
             self.online_layer_pattern_specs: list[tuple[str, LayerQuantConfig]] = []
             self.online_exclude_layers: list[str] = []
+            self.atom_native_checkpoint = None
             return
 
         # Some HF configs set torch_dtype=None; normalize to bf16 default.
         self.torch_dtype = getattr(config, "torch_dtype", None) or torch.bfloat16
         self.hf_quant_config = getattr(config, "quantization_config", None)
+        self.atom_native_checkpoint = getattr(
+            config, "atom_native_checkpoint", None
+        )
 
         if self.hf_quant_config is None:
             self.global_spec = LayerQuantConfig.no_quant(self.torch_dtype)
@@ -621,7 +625,9 @@ _CONFIG_REGISTRY: dict[str, str] = {
 # model_types that exist only as speculative-draft checkpoints. transformers
 # has no config class for them, so AutoConfig.from_pretrained raises; load them
 # as a bare PretrainedConfig instead (see get_hf_config).
-_PLAIN_CONFIG_MODEL_TYPES: frozenset[str] = frozenset({"k3_dspark"})
+_PLAIN_CONFIG_MODEL_TYPES: frozenset[str] = frozenset(
+    {"k3_dspark", "atom_k3_dspark"}
+)
 
 _MULTIMODAL_MODEL_TYPES: dict[str, str] = {
     # Maps multimodal model_type -> key in config_dict for the text sub-config

@@ -24,6 +24,10 @@ if "F8_E8M0" not in safetensors.torch._TYPES and hasattr(torch, "float8_e8m0fnu"
 from aiter.dist.parallel_state import get_tp_group
 
 from atom.model_loader.loading_core import load_weights_into_model, rank_tag
+from atom.model_loader.native_dspark import (
+    is_atom_native_dspark_config,
+    validate_atom_native_dspark_config,
+)
 from atom.model_loader.online_quant_streaming import OnlineQuantStreamer
 from atom.model_loader.weight_iterator import (
     safetensors_weights_iterator,
@@ -248,6 +252,8 @@ def load_model(
 
     `is_plugin_mode` is unused and kept for call-site compatibility.
     """
+    if is_atom_native_dspark_config(hf_config):
+        validate_atom_native_dspark_config(hf_config)
 
     def _fuse_shared_expert(
         shared_expert_prefix: str, routed_expert_prefix: str

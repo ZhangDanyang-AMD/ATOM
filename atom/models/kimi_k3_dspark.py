@@ -59,6 +59,10 @@ from aiter import QuantType, dtypes
 from aiter.rotary_embedding import get_rope
 from torch import nn
 
+from atom.model_loader.native_dspark import (
+    is_atom_native_dspark_config,
+    validate_atom_native_dspark_config,
+)
 from atom.model_ops.activation import SiluAndMul
 from atom.model_ops.attention_mla import MLAModules, mla_min_query_heads
 from atom.model_ops.base_attention import Attention
@@ -238,6 +242,17 @@ class K3DSparkMLAAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.fused_qkv_a_proj",
         )
+        self.context_kv_proj = (
+            ReplicatedLinear(
+                self.hidden_size,
+                self.kv_lora_rank + self.qk_rope_head_dim,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.context_kv_proj",
+            )
+            if is_atom_native_dspark_config(config)
+            else None
+        )
         # Both A-norms stay plain modules: on the block pass they are applied by
         # one `_fuse_rmsnorm_quant` launch (q norm + q activation quant + kv
         # norm), which reads their `.weight` / `.eps` directly. The module form
@@ -373,21 +388,17 @@ class K3DSparkMLAAttention(nn.Module):
         positions: torch.Tensor,  # [N]         absolute positions
         slot_mapping: torch.Tensor,  # [N]      flat slots in the paged pool
     ) -> None:
-        """Project the target context into this layer's latent cache rows.
-
-        The checkpoint keeps q_a and kv_a as one fused weight and so does this
-        module (see packed_modules_mapping); the block pass in :meth:`forward`
-        wants both halves, this path only the kv one -- so 1536 of the 2112
-        output columns are computed and dropped. Narrowing the GEMM to the kv
-        shard is not available where it would pay: the served configuration
-        quantizes this projection per output channel and preshuffles its rows,
-        after which a row slice of the merged weight is not that shard's weight.
-        (vLLM's reference computes the full projection here too, and offers a
-        cross-layer fused fast path on top; that optimization is not ported.)
-        """
-        kv_lora = _linear_out(self.fused_qkv_a_proj(ctx_hidden))[
-            ..., self.q_lora_rank :
-        ]
+        """Project target context into this layer's 576-wide latent cache row."""
+        if self.context_kv_proj is None:
+            # Portable checkpoints retain the original merged projection and
+            # discard q_a on this path.
+            kv_lora = _linear_out(self.fused_qkv_a_proj(ctx_hidden))[
+                ..., self.q_lora_rank :
+            ]
+        else:
+            # ATOM-native checkpoints duplicate the exact BF16 kv_a rows under
+            # a dedicated runtime name, avoiding 1536 unused q_a outputs.
+            kv_lora = _linear_out(self.context_kv_proj(ctx_hidden))
         # norm + rope + concat + store live behind one call so every cache
         # layout stays in the attention impl: the normal store hardcodes
         # attn_metadata.slot_mapping, which is the draft block's, not these
@@ -606,6 +617,11 @@ class KimiK3DSpark(DSparkDraftModel):
         self.atom_config = atom_config
         config = atom_config.hf_config
         self.hf_config = config
+        self.atom_native_checkpoint = (
+            validate_atom_native_dspark_config(config)
+            if is_atom_native_dspark_config(config)
+            else None
+        )
 
         self.hidden_size = config.hidden_size
         self.noise_token_id = int(config.dspark_noise_token_id)
@@ -617,10 +633,19 @@ class KimiK3DSpark(DSparkDraftModel):
         # hidden states arrive replicated (they are the target's residual
         # stream), so a row-parallel split would trade memory for an all-reduce
         # on every drafting step.
+        # Preserve the original BF16 path when the draft has no checkpoint
+        # quantization metadata. Pre-quantized drafts use their own config:
+        # Phase 1 excludes context_proj, while Phase 2 can opt it into PTPC.
+        context_quant_config = (
+            atom_config.quant_config
+            if getattr(config, "quantization_config", None) is not None
+            else None
+        )
         self.context_proj = ReplicatedLinear(
             config.target_hidden_size * config.num_target_layers,
             self.hidden_size,
             bias=False,
+            quant_config=context_quant_config,
             prefix="context_proj",
         )
         self.context_norm = RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
@@ -736,7 +761,18 @@ class KimiK3DSpark(DSparkDraftModel):
         out_ids[:, 0] = anchor_ids
         for k in range(T):
             # Greedy: temperature/sampling is applied by the target's verify.
-            out_ids[:, k + 1], _ = self.markov_head.sample_next(
+            next_ids, _ = self.markov_head.sample_next(
                 out_ids[:, k], base_logits[:, k]
             )
+            # A token id feeds the next iteration's embedding lookup. Keep that
+            # memory-safety boundary explicit even if a future fused sampler
+            # encounters non-finite logits or otherwise returns a sentinel.
+            out_ids[:, k + 1] = next_ids.clamp(0, self.vocab_size - 1)
         return out_ids[:, 1:]
+
+
+class AtomK3DSparkModel(KimiK3DSpark):
+    """ATOM-only K3 DSpark model backed by the native merged FP8 schema."""
+
+    def __init__(self, atom_config: "Config", layer_offset: int = 0) -> None:
+        super().__init__(atom_config, layer_offset=layer_offset)
