@@ -15,3 +15,6 @@ class RequestOutput:
     finish_reason: Optional[str] = None
     kv_transfer_params_output: Optional[Dict[str, Any]] = None
     num_cached_tokens: int = 0
+    spec_verify_ct: int = 0
+    spec_accept_token_num: int = 0
+    spec_draft_token_num: int = 0

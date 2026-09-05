@@ -133,3 +133,20 @@ class TestNothingButOpenAIsOwnWordsReachTheClient:
         """A chunk mid-generation has no reason, and `None` is how the wire
         says so -- not `"stop"`, which would end the response early."""
         assert openai_stop_reason(None) is None
+
+
+def test_non_streaming_response_reports_request_local_spec_metrics():
+    output = _output("eos")
+    output.update(
+        spec_verify_ct=4,
+        spec_accept_token_num=10,
+        spec_draft_token_num=28,
+        spec_accept_length=3.5,
+    )
+
+    usage = build_completion_response("r", "m", output).usage
+
+    assert usage["spec_verify_ct"] == 4
+    assert usage["spec_accept_token_num"] == 10
+    assert usage["spec_draft_token_num"] == 28
+    assert usage["spec_accept_length"] == 3.5

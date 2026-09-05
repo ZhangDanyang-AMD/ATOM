@@ -73,6 +73,15 @@ class Sampler(nn.Module):
         Returns:
             Sampled token IDs (num_tokens,)
         """
+        # Greedy decoding must be exact argmax even when top-k/top-p filtering is
+        # disabled. Previously the no-filter path fell through to the
+        # Gumbel/exponential sampler with temperature clamped to ``eps``. That
+        # made temperature=0 requests consume RNG and could choose a different
+        # token from argmax, so identical requests (and different draft
+        # checkpoints) produced different target trajectories.
+        if all_greedy:
+            return logits.argmax(dim=-1).to(torch.int)
+
         # No Top-K Top-P parameters, perform temperature-based sampling
         if not self._needs_filtering(top_ks, top_ps):
             return self._temperature_sample(

@@ -856,15 +856,23 @@ async def generate_async(
     seq = None
     kv_transfer_output_meta_info = None
     num_cached_tokens_seen = 0
+    spec_verify_ct = 0
+    spec_accept_token_num = 0
+    spec_draft_token_num = 0
 
     def completion_callback(request_output: RequestOutput):
         nonlocal kv_transfer_output_meta_info, num_cached_tokens_seen
+        nonlocal spec_verify_ct, spec_accept_token_num, spec_draft_token_num
         kv_transfer_output_meta_info = getattr(
             request_output, "kv_transfer_params_output", None
         )
         _ct = getattr(request_output, "num_cached_tokens", 0)
         if _ct:
             num_cached_tokens_seen = _ct
+        if request_output.finished:
+            spec_verify_ct = request_output.spec_verify_ct
+            spec_accept_token_num = request_output.spec_accept_token_num
+            spec_draft_token_num = request_output.spec_draft_token_num
         now = time.time()
         loop.call_soon_threadsafe(
             token_queue.put_nowait,
@@ -952,6 +960,12 @@ async def generate_async(
         "tpot": tpot,
         "latency": latency,
         "num_cached_tokens": num_cached_tokens_seen,
+        "spec_verify_ct": spec_verify_ct,
+        "spec_accept_token_num": spec_accept_token_num,
+        "spec_draft_token_num": spec_draft_token_num,
+        "spec_accept_length": (
+            1 + spec_accept_token_num / spec_verify_ct if spec_verify_ct else 1.0
+        ),
     }
     if kv_transfer_output_meta_info is not None:
         response["kv_transfer_output_meta_info"] = kv_transfer_output_meta_info

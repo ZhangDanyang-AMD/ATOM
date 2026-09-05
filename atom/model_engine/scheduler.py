@@ -2119,6 +2119,9 @@ class Scheduler:
                     and (num_new_token + num_rejected) > 1
                 ):
                     self.engine_stats.update_spec(num_new_token)
+                    seq.spec_verify_ct += 1
+                    seq.spec_accept_token_num += num_new_token - 1
+                    seq.spec_draft_token_num += self.mtp_k
                 seq.num_rejected = num_rejected
                 seq.num_bonus_tokens = num_bonus
                 # DSpark Phase 2: stash this step's scheduler-chosen ell on the
@@ -2317,6 +2320,9 @@ class Scheduler:
                         seq, "kv_transfer_params_output", None
                     ),
                     num_cached_tokens=getattr(seq, "prefix_cache_hit_tokens", 0),
+                    spec_verify_ct=seq.spec_verify_ct,
+                    spec_accept_token_num=seq.spec_accept_token_num,
+                    spec_draft_token_num=seq.spec_draft_token_num,
                 )
 
                 if request_output.kv_transfer_params_output is not None:

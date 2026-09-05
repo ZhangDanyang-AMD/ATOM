@@ -167,6 +167,10 @@ def build_completion_response(
             "ttft_s": round(final_output.get("ttft", 0.0), 4),
             "tpot_s": round(final_output.get("tpot", 0.0), 4),
             "latency_s": round(final_output.get("latency", 0.0), 4),
+            "spec_verify_ct": final_output.get("spec_verify_ct", 0),
+            "spec_accept_token_num": final_output.get("spec_accept_token_num", 0),
+            "spec_draft_token_num": final_output.get("spec_draft_token_num", 0),
+            "spec_accept_length": final_output.get("spec_accept_length", 1.0),
         },
     )
     if "kv_transfer_output_meta_info" in final_output:

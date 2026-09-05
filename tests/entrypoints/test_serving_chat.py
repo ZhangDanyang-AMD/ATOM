@@ -230,6 +230,19 @@ class TestBuildChatResponse:
         assert resp.usage["tpot_s"] == 0.03
         assert resp.usage["latency_s"] == 0.8
 
+    def test_request_local_spec_metrics_in_usage(self):
+        output = self._make_output(
+            spec_verify_ct=4,
+            spec_accept_token_num=10,
+            spec_draft_token_num=28,
+            spec_accept_length=3.5,
+        )
+        usage = build_chat_response("req-1", "model", "text", output).usage
+        assert usage["spec_verify_ct"] == 4
+        assert usage["spec_accept_token_num"] == 10
+        assert usage["spec_draft_token_num"] == 28
+        assert usage["spec_accept_length"] == 3.5
+
 
 # ============================================================================
 # build_chat_response_multi Tests (SamplingParams.n > 1 fan-out)

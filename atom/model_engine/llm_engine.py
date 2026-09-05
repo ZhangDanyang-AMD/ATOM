@@ -821,6 +821,14 @@ class InputOutputProcessor:
                 "num_tokens_output": req.num_completion_tokens,
                 "ttft": ttft,  # Time to first token in seconds
                 "tpot": tpot,  # Time per output token in seconds
+                "spec_verify_ct": req.spec_verify_ct,
+                "spec_accept_token_num": req.spec_accept_token_num,
+                "spec_draft_token_num": req.spec_draft_token_num,
+                "spec_accept_length": (
+                    1 + req.spec_accept_token_num / req.spec_verify_ct
+                    if req.spec_verify_ct
+                    else 1.0
+                ),
             }
         return outputs
 

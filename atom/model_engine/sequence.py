@@ -116,6 +116,12 @@ class Sequence:
         self.num_tokens = len(self.token_ids)
         self.num_prompt_tokens = len(token_ids)
         self.num_rejected = 0
+        # Request-local speculative counters. These mirror EngineStats but stay
+        # attached to the sequence so concurrent benchmark requests can report
+        # SGLang-compatible per-request acceptance metrics.
+        self.spec_verify_ct = 0
+        self.spec_accept_token_num = 0
+        self.spec_draft_token_num = 0
         self.num_cached_tokens = 0
         # Tokens whose blocks are registered in the prefix cache: through the
         # prompt as chunks finalize, then on through decode as generated blocks
